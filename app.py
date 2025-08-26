@@ -7,7 +7,7 @@ PM Compass – Flask アプリ（PDFアップロード＆分析対応版）
   2) 会話履歴（直近 N 発話）を Responses API 入力に積む（サイドバーで1～50から選択、デフォルト10）  
   3) ベクター検索を実装（Azure OpenAI Embeddings + Azure Cognitive Search vector_queries）  
   4) reasoning パラメータをモデルに応じて条件付与  
-  5) UI からモデルを選択可能（gpt-4o / gpt4.1 / o3 / o4-mini / gpt-5）  
+  5) UI からモデルを選択可能（gpt-4o / gpt-4.1 / o3 / o4-mini / gpt-5）  
   6) o3 / o4-mini / gpt-5 選択時は reasoning_effort（low/medium/high）を指定可能  
   7) 履歴の assistant 発話は content.type="output_text" で送信（gpt-5 400 対策）  
   8) 検索インデックスを UI から選択可能（表示名→インデックス名のマッピング）  
@@ -623,7 +623,7 @@ def index():
         # モデル切替＋reasoning_effort 切替  
         if 'set_model' in request.form:  
             selected = request.form.get("model", "").strip()  
-            allowed_models = {"gpt-4o", "gpt4.1", "o3", "o4-mini", "gpt-5"}  
+            allowed_models = {"gpt-4o", "gpt-4.1", "o3", "o4-mini", "gpt-5"}  
             if selected in allowed_models:  
                 session["selected_model"] = selected  
   
