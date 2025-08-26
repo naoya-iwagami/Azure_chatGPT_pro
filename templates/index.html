@@ -2,7 +2,7 @@
 <html lang="ja">  
 <head>  
     <meta charset="UTF-8">  
-    <title>PM Compass app</title>  
+    <title>PM Compass PRO</title>  
     <link rel="stylesheet"  
           href="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">  
     <link rel="stylesheet"  
@@ -42,7 +42,7 @@
                     <label for="model_select">モデルを選択</label>  
                     <select id="model_select" name="model" class="form-control" onchange="this.form.submit()">  
                         <option value="gpt-4o" {% if session.get('selected_model') == 'gpt-4o' %}selected{% endif %}>gpt-4o</option>  
-                        <option value="gpt4.1" {% if session.get('selected_model') == 'gpt4.1' %}selected{% endif %}>gpt4.1</option>  
+                        <option value="gpt-4.1" {% if session.get('selected_model') == 'gpt-hj' %}selected{% endif %}>gpt-4.1</option>  
                         <option value="o3" {% if session.get('selected_model') == 'o3' %}selected{% endif %}>o3</option>  
                         <option value="o4-mini" {% if session.get('selected_model') == 'o4-mini' %}selected{% endif %}>o4-mini</option>  
                         <option value="gpt-5" {% if session.get('selected_model') == 'gpt-5' %}selected{% endif %}>gpt-5</option>  
@@ -237,7 +237,7 @@
         <!-- メインコンテンツ -->  
         <div class="col-md-9 main-content">  
             <div id="mainHeader" class="d-flex align-items-center justify-content-between mb-3">  
-                <h1 class="app-title mb-0">PM Compass app</h1>  
+                <h1 class="app-title mb-0">PM Compass PRO</h1>  
                 <div id="loadingInline">  
                     <span class="spinner-border spinner-border-sm text-primary" role="status"></span>  
                     <span class="loading-text">応答中です。しばらくお待ちください…</span>  
