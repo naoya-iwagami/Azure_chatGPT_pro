@@ -18,8 +18,8 @@
   
         /* 検索に利用された文書の一覧スクロール領域 */  
         #searchFilesUlContainer {  
-            max-height: 50vh;          /* 画面高の約半分までに制限 */  
-            overflow-y: auto;          /* 縦スクロールを有効化 */  
+            max-height: 50vh;  /* 画面高の約半分までに制限 */  
+            overflow-y: auto;  /* 縦スクロールを有効化 */  
             border: 1px solid #e0e0e0; /* 見やすいよう枠線 */  
             background: #fff;  
             margin-top: .5rem;  
@@ -42,7 +42,7 @@
                     <label for="model_select">モデルを選択</label>  
                     <select id="model_select" name="model" class="form-control" onchange="this.form.submit()">  
                         <option value="gpt-4o" {% if session.get('selected_model') == 'gpt-4o' %}selected{% endif %}>gpt-4o</option>  
-                        <option value="gpt-4.1" {% if session.get('selected_model') == 'gpt-hj' %}selected{% endif %}>gpt-4.1</option>  
+                        <option value="gpt-4.1" {% if session.get('selected_model') == 'gpt-4.1' %}selected{% endif %}>gpt-4.1</option>  
                         <option value="o3" {% if session.get('selected_model') == 'o3' %}selected{% endif %}>o3</option>  
                         <option value="o4-mini" {% if session.get('selected_model') == 'o4-mini' %}selected{% endif %}>o4-mini</option>  
                         <option value="gpt-5" {% if session.get('selected_model') == 'gpt-5' %}selected{% endif %}>gpt-5</option>  
@@ -386,7 +386,7 @@ document.addEventListener('DOMContentLoaded', function() {
             if (data.response) appendAssistantMessage(data.response);  
             // Reasoning summary: 本文があれば出す  
             appendReasoningSummary(data.reasoning_summary);  
-            // RAG文書（クリックで展開/非表示機能付き）スクロール対応  
+            // RAG文書（クリックで展開/非表示機能付き）スクロール対応 + ナンバリング  
             if (Array.isArray(data.search_files) && data.search_files.length > 0) {  
                 searchFilesDisplay.style.display = 'block';  
                 currentSearchFiles = data.search_files;  
@@ -397,7 +397,8 @@ document.addEventListener('DOMContentLoaded', function() {
                     let dlBtn = (file.url)  
                         ? `<a href="${file.url}" download style="margin-left:8px;" class="btn btn-link btn-sm" title="ダウンロード" target="_blank"><span class="fa fa-download"></span>ダウンロード</a>`  
                         : '';  
-                    ul += `<li><a href="#" class="doclink" data-docidx="${idx}" style="text-decoration:underline; cursor:pointer">${escapeHtml(file.title)}</a> ${dlBtn}</li>`;  
+                    // ここで 1,2,3... を付与  
+                    ul += `<li><span class="doc-num">${idx + 1}.</span> <a href="#" class="doclink" data-docidx="${idx}" style="text-decoration:underline; cursor:pointer">${escapeHtml(file.title)}</a> ${dlBtn}</li>`;  
                 });  
                 ul += "</ul></div>";  
                 searchFilesDisplay.innerHTML = title + ul;  

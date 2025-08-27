@@ -146,3 +146,15 @@ html, body {
     background: #d0e6f7;  
     color: #17416a;  
 }  
+  
+/* RAG文書リストのナンバリング見た目調整 */  
+#searchFilesUlContainer li {  
+    list-style: none;  
+    margin-bottom: 4px;  
+}  
+#searchFilesUlContainer .doc-num {  
+    display: inline-block;  
+    width: 1.6em;       /* 2桁でもズレないよう固定幅 */  
+    font-weight: 600;  
+    color: #1563a6;  
+}  
