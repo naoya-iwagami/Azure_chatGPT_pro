@@ -4,7 +4,6 @@
 PM Compass – Flask アプリ（PDFアップロード＆分析対応版, 埋め込み分離 + RRFオーバーフェッチ対応）  
   
 主な機能:  
-  
 - Azure OpenAI Responses API を使用（system 役割、会話履歴、reasoning 対応）  
 - Azure Cognitive Search のハイブリッド検索（キーワード＋セマンティック＋ベクター, RRF融合）  
 - 取得ドキュメント数を 1～300 の範囲で変更可能（デフォルト10）  
@@ -16,13 +15,15 @@ PM Compass – Flask アプリ（PDFアップロード＆分析対応版, 埋め
   
 修正点の要旨:  
 - Azure Cognitive Search クライアントに api_version="2024-07-01" を明示  
-- セマンティック検索で @search.rerankerScore を利用し、strictness 既定値を 0.0 に  
-- ハイブリッド融合時の重複判定キーを強化（filepath → id → title）  
-- 取得ドキュメント数の上限を 300 に拡張  
-- 埋め込みは別の Azure OpenAI エンドポイント/キー/APIバージョン/デプロイ名で呼び出せるよう分離  
-  - AZURE_OPENAI_EMBED_ENDPOINT / AZURE_OPENAI_EMBED_KEY / AZURE_OPENAI_EMBED_API_VERSION / AZURE_OPENAI_EMBED_DEPLOYMENT を追加  
-- RRF のオーバーフェッチを導入（ユニーク文書数の不足を緩和）  
-  - RRF_FETCH_MULTIPLIER（既定2.5倍）と RRF_FETCH_MAX_TOP（既定300）で調整  
+- セマンティック検索で @search.rerankerScore を利用（strictness 既定 0.0）  
+- ハイブリッド融合の重複判定をチャンク単位（chunk_id 優先）に変更  
+  - parent_id ごとの採択上限（MAX_CHUNKS_PER_PARENT、デフォルト無制限）にも対応  
+- RRF のオーバーフェッチ導入（不足緩和）  
+- 埋め込みは別エンドポイント利用可（分離）  
+- ダウンロード修正:  
+  - filepath 最優先で解決  
+  - url は Azure Blob URL の場合のみフォールバック  
+  - Windows 区切りを / に正規化  
 """  
   
 import os  
@@ -34,7 +35,7 @@ import base64
 import threading  
 import datetime  
 import traceback  
-from urllib.parse import quote, unquote  
+from urllib.parse import quote, unquote, urlparse  
   
 from flask import (  
     Flask, request, render_template, redirect, url_for, session,  
@@ -55,14 +56,10 @@ from azure.storage.blob import (
 from openai import AzureOpenAI  
 import markdown2  
   
-# プロキシ（SyntaxError 解消: 行を分割）  
-os.environ['HTTP_PROXY'] = 'http://g3.konicaminolta.jp:8080'  
-os.environ['HTTPS_PROXY'] = 'http://g3.konicaminolta.jp:8080'  
-  
 # -------------------------------  
 # Azure OpenAI クライアント設定  
 # -------------------------------  
-# Responses 用クライアント（従来どおり）  
+# Responses 用クライアント  
 client = AzureOpenAI(  
     api_key=os.getenv("AZURE_OPENAI_KEY"),  
     base_url=os.getenv("AZURE_OPENAI_ENDPOINT"),  
@@ -71,11 +68,12 @@ client = AzureOpenAI(
 )  
   
 # 埋め込み用クライアント（別の Azure OpenAI リソース/バージョンに切替可）  
-# 未設定の場合は Responses と同じ設定を継承  
+# 未設定の場合は Responses と同じエンドポイントを利用  
+embed_endpoint = os.getenv("AZURE_OPENAI_EMBED_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")  
 embed_client = AzureOpenAI(  
     api_key=os.getenv("AZURE_OPENAI_KEY"),  
-    azure_endpoint=os.getenv("AZURE_OPENAI_EMBED_ENDPOINT"),  
-    api_version="2025-04-01-preview"
+    azure_endpoint=embed_endpoint,  
+    api_version="2025-04-01-preview"  
 )  
   
 # モデル・埋め込み・検索設定  
@@ -86,7 +84,7 @@ REASONING_ENABLED_MODELS = set(
 REASONING_EFFORT = os.getenv("REASONING_EFFORT", "high")  
   
 # Azure OpenAI の埋め込みは「デプロイ名」を指定  
-EMBEDDING_MODEL = "text-embedding-3-large" 
+EMBEDDING_MODEL = "text-embedding-3-large"  
 VECTOR_FIELD = "contentVector"  
   
 MAX_HISTORY_TO_SEND = int(os.getenv("MAX_HISTORY_TO_SEND", "10"))   # 1～50  
@@ -96,6 +94,9 @@ DEFAULT_DOC_COUNT = int(os.getenv("DEFAULT_DOC_COUNT", "10"))       # 1～300
 RRF_FETCH_MULTIPLIER = float(os.getenv("RRF_FETCH_MULTIPLIER", "3.0"))  # 各方式の取得件数倍率  
 RRF_FETCH_MAX_TOP = int(os.getenv("RRF_FETCH_MAX_TOP", "300"))          # サービス上限に合わせる  
   
+# 親ドキュメントごとのチャンク採択上限（0=無制限）  
+MAX_CHUNKS_PER_PARENT = int(os.getenv("MAX_CHUNKS_PER_PARENT", "0"))  
+  
 # -------------------------------  
 # Flask アプリ設定  
 # -------------------------------  
@@ -104,7 +105,6 @@ app.secret_key = os.getenv('FLASK_SECRET_KEY', 'your-default-secret-key')
 app.config['SESSION_TYPE'] = 'filesystem'  
 app.config['SESSION_FILE_DIR'] = '/tmp/flask_session'  
 app.config['SESSION_PERMANENT'] = False  
-# セッションディレクトリが無い場合に備えて作成（任意・安全）  
 os.makedirs(app.config['SESSION_FILE_DIR'], exist_ok=True)  
 Session(app)  
   
@@ -143,6 +143,19 @@ INDEX_OPTIONS = [
 ]  
 INDEX_VALUES = {v for (_, v) in INDEX_OPTIONS}  
 DEFAULT_SEARCH_INDEX = INDEX_OPTIONS[0][1]  
+  
+# インデックス名 → Blobコンテナ名のマッピング（環境に合わせて調整）  
+INDEX_TO_BLOB_CONTAINER = {  
+    "filetest11-large": "filetest11",  
+    "filetest13": "filetest13",  
+    "filetest14": "filetest14",  
+    "filetest15": "filetest15",  
+    "filetest16": "filetest16",  
+    "filetest17": "filetest17",  
+    "filetest18": "filetest18",  
+    "quality-assurance": "quality-assurance",  
+}  
+DEFAULT_BLOB_CONTAINER_FOR_SEARCH = INDEX_TO_BLOB_CONTAINER.get(DEFAULT_SEARCH_INDEX, "filetest11")  
   
 # スレッドロック  
 lock = threading.Lock()  
@@ -225,13 +238,11 @@ def extract_output_text(resp) -> str:
     - なければ output 配列から message/content を走査して text を連結  
     """  
     try:  
-        # 1) 最優先: aggregated output_text  
         if hasattr(resp, "output_text") and resp.output_text:  
             return resp.output_text  
         if isinstance(resp, dict) and resp.get("output_text"):  
             return resp["output_text"]  
   
-        # 2) フォールバック: output 配列から抽出  
         text_parts = []  
         out_arr = getattr(resp, "output", None)  
         if out_arr is None and isinstance(resp, dict):  
@@ -253,6 +264,51 @@ def extract_output_text(resp) -> str:
         print("output_text 抽出エラー:", e)  
         traceback.print_exc()  
         return ""  
+  
+def is_azure_blob_url(u: str) -> bool:  
+    """Azure Blob の URL かどうか（SAS 生成対象か判定）"""  
+    if not u:  
+        return False  
+    try:  
+        p = urlparse(u)  
+        if p.scheme not in ("http", "https"):  
+            return False  
+        host = p.netloc.lower()  
+        return (".blob.core.windows.net" in host) or host.startswith("127.0.0.1") or host.startswith("localhost")  
+    except Exception:  
+        return False  
+  
+# url/filepath から (container, blobname) を解決するヘルパー  
+def resolve_blob_from_filepath(selected_index: str, path_or_url: str):  
+    """  
+    検索結果の url / filepath 文字列から (container, blobname) を解決する。  
+    - フルURLの場合は Azure Blob のみ解決（その他のURLは対象外）  
+    - 相対パスの場合はインデックス名→コンテナ名のマッピングを適用  
+    - 先頭に container/ が含まれていれば取り除く  
+    """  
+    if not path_or_url:  
+        return None, None  
+  
+    s = path_or_url.strip().replace("\\", "/")  
+  
+    # フルURL  
+    if s.startswith("http://") or s.startswith("https://"):  
+        if not is_azure_blob_url(s):  
+            return None, None  
+        try:  
+            u = urlparse(s)  
+            parts = u.path.lstrip("/").split("/", 1)  
+            if len(parts) == 2:  
+                return parts[0], parts[1]  
+        except Exception:  
+            return None, None  
+  
+    # 相対パス → インデックス名→コンテナ名のマッピング  
+    container = INDEX_TO_BLOB_CONTAINER.get(selected_index, DEFAULT_BLOB_CONTAINER_FOR_SEARCH)  
+    blobname = s.lstrip("/")  
+    if container and blobname.startswith(container + "/"):  
+        blobname = blobname[len(container) + 1:]  
+    return container, blobname  
   
 # -------------------------------  
 # 認証/履歴/指示テンプレート  
@@ -467,7 +523,7 @@ def keyword_search(query, topNDocuments, index_name):
     results = sc.search(  
         search_text=query,  
         search_fields=["title", "content"],  
-        select="title, content, filepath",  
+        select="chunk_id, parent_id, title, content, filepath, url",  
         query_type="simple",  
         top=topNDocuments  
     )  
@@ -482,14 +538,13 @@ def keyword_semantic_search(query, topNDocuments, index_name, strictness=0.0):
     results = sc.search(  
         search_text=query,  
         search_fields=["title", "content"],  
-        select="title, content, filepath",  
+        select="chunk_id, parent_id, title, content, filepath, url",  
         query_type="semantic",  
         semantic_configuration_name="default",  
         query_caption="extractive",  
         query_answer="extractive",  
         top=top  
     )  
-    # rerankerScore を優先  
     filtered = []  
     for r in results:  
         score = r.get("@search.rerankerScore", r.get("@search.score", 0.0))  
@@ -500,9 +555,7 @@ def keyword_semantic_search(query, topNDocuments, index_name, strictness=0.0):
   
 def get_query_embedding(query):  
     try:  
-        # Azure OpenAI: model には「埋め込みデプロイ名」を指定  
-        resp = embed_client.embeddings.create(model=EMBEDDING_MODEL, input=query,  
-            dimensions=1536)  
+        resp = embed_client.embeddings.create(model=EMBEDDING_MODEL, input=query, dimensions=1536)  
         return resp.data[0].embedding  
     except Exception as e:  
         print("Embedding 生成エラー:", e)  
@@ -516,7 +569,6 @@ def keyword_vector_search(query, topNDocuments, index_name):
         if not embedding:  
             return []  
   
-        # 必ず辞書形式で "kind": "vector" をセット  
         vector_query = {  
             "kind": "vector",  
             "vector": embedding,  
@@ -528,7 +580,7 @@ def keyword_vector_search(query, topNDocuments, index_name):
         results = sc.search(  
             search_text="*",  
             vector_queries=[vector_query],  
-            select="title, content, filepath",  
+            select="chunk_id, parent_id, title, content, filepath, url",  
             top=topNDocuments  
         )  
         results_list = list(results)  
@@ -545,21 +597,22 @@ def hybrid_search_multiqueries(queries, topNDocuments, index_name, strictness=0.
     """  
     RRF によるハイブリッド融合  
     - 各方式はオーバーフェッチし、最後に topNDocuments で切り詰める  
+    - 重複判定はチャンク単位（chunk_id 優先）。同一チャンクは統合、別チャンクは残す  
+    - 任意で parent_id ごとの採択上限を設ける（MAX_CHUNKS_PER_PARENT）  
     """  
     rrf_k = 60  
     fusion_scores = {}  
     fusion_docs = {}  
   
-    # オーバーフェッチ件数を算出  
     try:  
         req_top = int(topNDocuments)  
     except Exception:  
         req_top = 10  
-    # 倍率を適用してサービス上限でクリップ  
     fetch_top = int(min(RRF_FETCH_MAX_TOP, max(req_top, req_top * RRF_FETCH_MULTIPLIER)))  
   
+    parent_counts = {}  
+  
     for q in queries:  
-        # 3 種類の結果を統合（オーバーフェッチ）  
         lists = [  
             keyword_search(q, fetch_top, index_name),  
             keyword_semantic_search(q, fetch_top, index_name, strictness),  
@@ -567,20 +620,29 @@ def hybrid_search_multiqueries(queries, topNDocuments, index_name, strictness=0.
         ]  
         for result_list in lists:  
             for idx, r in enumerate(result_list):  
-                # 重複判定キー（優先順）  
-                doc_id = r.get("filepath") or r.get("id") or r.get("title")  
-                if not doc_id:  
+                dedup_key = r.get("chunk_id") or r.get("filepath") or r.get("id") or r.get("title")  
+                if not dedup_key:  
                     continue  
-                contribution = 1 / (rrf_k + (idx + 1))  
-                fusion_scores[doc_id] = fusion_scores.get(doc_id, 0) + contribution  
-                if doc_id not in fusion_docs:  
-                    fusion_docs[doc_id] = r  
   
-    sorted_doc_ids = sorted(fusion_scores, key=lambda d: fusion_scores[d], reverse=True)  
+                parent_id = r.get("parent_id")  
+                if MAX_CHUNKS_PER_PARENT > 0 and parent_id and dedup_key not in fusion_docs:  
+                    if parent_counts.get(parent_id, 0) >= MAX_CHUNKS_PER_PARENT:  
+                        continue  
+  
+                contribution = 1 / (rrf_k + (idx + 1))  
+                prev = fusion_scores.get(dedup_key)  
+                fusion_scores[dedup_key] = (prev or 0) + contribution  
+  
+                if dedup_key not in fusion_docs:  
+                    fusion_docs[dedup_key] = r  
+                    if MAX_CHUNKS_PER_PARENT > 0 and parent_id:  
+                        parent_counts[parent_id] = parent_counts.get(parent_id, 0) + 1  
+  
+    sorted_keys = sorted(fusion_scores, key=lambda d: fusion_scores[d], reverse=True)  
     fused_results = []  
-    for doc_id in sorted_doc_ids[:req_top]:  
-        r = fusion_docs[doc_id]  
-        r["fusion_score"] = fusion_scores[doc_id]  
+    for k in sorted_keys[:req_top]:  
+        r = fusion_docs[k]  
+        r["fusion_score"] = fusion_scores[k]  
         fused_results.append(r)  
     return fused_results  
   
@@ -588,14 +650,6 @@ def hybrid_search_multiqueries(queries, topNDocuments, index_name, strictness=0.
 # Responses API 入力を構築  
 # -------------------------------  
 def build_responses_input_with_history(all_messages, system_message, context_text, max_history_to_send=None):  
-    """  
-    Responses API に渡す input を組み立てる。  
-  
-    - system_message を role=system として先頭に追加  
-    - 直近 max_history_to_send 件の履歴（user, assistant）を追加  
-    - 直近の user に context_text を input_text として追記  
-    - 添付は呼び出し側で最後の user の content に追加  
-    """  
     input_items = []  
   
     if system_message:  
@@ -940,7 +994,6 @@ def send_message():
   
     try:  
         selected_index = session.get("selected_search_index", DEFAULT_SEARCH_INDEX)  
-        blob_container_for_search = selected_index  # 必要に応じてマッピング変更  
   
         # 取得ドキュメント数（1～300）  
         doc_count = max(1, min(300, int(session.get("doc_count", DEFAULT_DOC_COUNT))))  
@@ -961,25 +1014,37 @@ def send_message():
         # UI 用リンク（SAS / テキストダウンロード）  
         search_files = []  
         for r in results_list:  
-            filepath = r.get('filepath', '')  
             title = r.get('title', '不明')  
             content = r.get('content', '')  
-            if filepath and filepath.lower().endswith('.txt'):  
-                url = url_for(  
-                    'download_txt',  
-                    container=blob_container_for_search,  
-                    blobname=quote(filepath)  
-                )  
-            elif filepath:  
-                try:  
-                    blob_client = blob_service_client.get_blob_client(  
-                        container=blob_container_for_search, blob=filepath  
-                    )  
-                    url = generate_sas_url(blob_client, filepath)  
-                except Exception:  
-                    url = ''  
+  
+            # 1) filepath を最優先（前回動いていたロジック）  
+            fp = (r.get('filepath') or '').replace('\\', '/')  
+            container, blobname = (None, None)  
+            if fp:  
+                container, blobname = resolve_blob_from_filepath(selected_index, fp)  
             else:  
-                url = ''  
+                # 2) filepath が無い場合のみ、Azure Blob の url に限ってフォールバック  
+                u = r.get('url') or ''  
+                if is_azure_blob_url(u):  
+                    container, blobname = resolve_blob_from_filepath(selected_index, u)  
+  
+            url = ''  
+            if container and blobname:  
+                try:  
+                    if blobname.lower().endswith('.txt'):  
+                        url = url_for(  
+                            'download_txt',  
+                            container=container,  
+                            blobname=quote(blobname)  
+                        )  
+                    else:  
+                        blob_client = blob_service_client.get_blob_client(  
+                            container=container, blob=blobname  
+                        )  
+                        url = generate_sas_url(blob_client, blobname)  
+                except Exception as e:  
+                    print("SAS/ダウンロードURL生成エラー:", e)  
+  
             search_files.append({'title': title, 'content': content, 'url': url})  
   
         # system_message  
@@ -1062,7 +1127,6 @@ def send_message():
         )  
   
         if not output_text:  
-            # 応答が空のときのフォールバック（任意）  
             assistant_html = "<p>（応答テキストが空でした。もう一度お試しください）</p>"  
   
         reasoning_summary = extract_reasoning_summary(response)  
