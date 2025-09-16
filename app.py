@@ -62,6 +62,7 @@ from azure.storage.blob import (
 )  
 from openai import AzureOpenAI  
 import markdown2  
+
   
 # -------------------------------  
 # Azure OpenAI クライアント設定  
