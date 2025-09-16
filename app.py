@@ -1,10 +1,10 @@
 #!/usr/bin/env python3  
 # -*- coding: utf-8 -*-  
 """  
-PM Compass – Flask アプリ（PDFアップロード＆分析対応版, 埋め込み分離 + RRFオーバーフェッチ対応）  
+PM Compass – Flask アプリ（PDFアップロード＆分析対応版, 埋め込み分離 + RRFオーバーフェッチ対応 + SSEストリーミング対応）  
   
 主な機能:  
-- Azure OpenAI Responses API を使用（system 役割、会話履歴、reasoning 対応）  
+- Azure OpenAI Responses API を使用（system 役割、会話履歴、reasoning 対応, ストリーミング対応）  
 - Azure Cognitive Search のハイブリッド検索（キーワード＋セマンティック＋ベクター, RRF融合）  
 - 取得ドキュメント数を 1～300 の範囲で変更可能（デフォルト10）  
 - 会話履歴の送信件数を 1～50 の範囲で変更可能（デフォルト10）  
@@ -12,18 +12,22 @@ PM Compass – Flask アプリ（PDFアップロード＆分析対応版, 埋め
 - 画像/PDF アップロード（画像: input_image, PDF: input_file）に対応  
 - Cosmos DB にチャット履歴・指示テンプレートを保存/読込/削除  
 - 検索結果（search_files）をフロントで番号付き表示し、SASリンクやテキストダウンロードも提供  
+- 新規: SSE によるストリーミング出力（/stream_message）。初回トークンが遅い場合も心拍(:keepalive)で接続維持  
   
 修正点の要旨:  
 - Azure Cognitive Search クライアントに api_version="2024-07-01" を明示  
 - セマンティック検索で @search.rerankerScore を利用（strictness 既定 0.0）  
 - ハイブリッド融合の重複判定をチャンク単位（chunk_id 優先）に変更  
-  - parent_id ごとの採択上限（MAX_CHUNKS_PER_PARENT、デフォルト無制限）にも対応  
+- parent_id ごとの採択上限（MAX_CHUNKS_PER_PARENT、デフォルト無制限）にも対応  
 - RRF のオーバーフェッチ導入（不足緩和）  
 - 埋め込みは別エンドポイント利用可（分離）  
 - ダウンロード修正:  
   - filepath 最優先で解決  
   - url は Azure Blob URL の場合のみフォールバック  
   - Windows 区切りを / に正規化  
+- 新規: SSE エンドポイント /stream_message を追加。X-Accel-Buffering: no, Cache-Control: no-cache,no-transform を明示し、:keepalive を定期送信  
+- 重要: /stream_message のレスポンスは direct_passthrough を使用しない（Flask が str→bytes 変換）  
+- 重要: stream_with_context でジェネレーターをラップし、SSE完了後の履歴保存時に request context を維持  
 """  
   
 import os  
@@ -35,12 +39,15 @@ import base64
 import threading  
 import datetime  
 import traceback  
+import time  # SSEの心拍用  
+import queue  # SSEの非同期キュー  
 from urllib.parse import quote, unquote, urlparse  
   
 from flask import (  
     Flask, request, render_template, redirect, url_for, session,  
-    flash, send_file  
+    flash, send_file, stream_with_context  # ← request context をSSE中維持  
 )  
+from flask import copy_current_request_context  # スレッドで request/app コンテキストを使う  
 from flask_session import Session  # pip install Flask-Session  
 from werkzeug.utils import secure_filename  
   
@@ -56,13 +63,17 @@ from azure.storage.blob import (
 from openai import AzureOpenAI  
 import markdown2  
   
+# 企業プロキシ環境などでのアウトバウンド設定（必要な場合のみ）  
+os.environ['HTTP_PROXY'] = 'http://g3.konicaminolta.jp:8080'  
+os.environ['HTTPS_PROXY'] = 'http://g3.konicaminolta.jp:8080'  
+  
 # -------------------------------  
 # Azure OpenAI クライアント設定  
 # -------------------------------  
-# Responses 用クライアント  
+# Responses 用クライアント（ストリーミング対応）  
 client = AzureOpenAI(  
     api_key=os.getenv("AZURE_OPENAI_KEY"),  
-    base_url=os.getenv("AZURE_OPENAI_ENDPOINT"),  
+    base_url=os.getenv("AZURE_OPENAI_ENDPOINT"),  # Azure 環境では azure_endpoint を使うのが一般的だが現状互換  
     api_version="preview",  
     default_headers={"x-ms-include-response-reasoning-summary": "true"}  
 )  
@@ -103,7 +114,7 @@ MAX_CHUNKS_PER_PARENT = int(os.getenv("MAX_CHUNKS_PER_PARENT", "0"))
 app = Flask(__name__)  
 app.secret_key = os.getenv('FLASK_SECRET_KEY', 'your-default-secret-key')  
 app.config['SESSION_TYPE'] = 'filesystem'  
-app.config['SESSION_FILE_DIR'] = '/tmp/flask_session'  
+app.config['SESSION_FILE_DIR'] = '/tmp/flask_session'  # Azure App Service(Linux)でもOKな一時領域  
 app.config['SESSION_PERMANENT'] = False  
 os.makedirs(app.config['SESSION_FILE_DIR'], exist_ok=True)  
 Session(app)  
@@ -164,10 +175,12 @@ lock = threading.Lock()
 # ユーティリティ  
 # -------------------------------  
 def extract_account_key(connection_string: str) -> str:  
+    # 接続文字列から AccountKey を抽出  
     pairs = [s.split("=", 1) for s in connection_string.split(";") if "=" in s]  
     return dict(pairs).get("AccountKey")  
   
 def generate_sas_url(blob_client, blob_name):  
+    # 短命なSAS（開始は少し過去、期限は1時間）  
     connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")  
     account_key = extract_account_key(connection_string)  
     start = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)  
@@ -184,11 +197,13 @@ def generate_sas_url(blob_client, blob_name):
     return f"{blob_client.url}?{sas_token}"  
   
 def encode_image_from_blob(blob_client):  
+    # Blob から画像を base64 エンコード  
     downloader = blob_client.download_blob()  
     image_bytes = downloader.readall()  
     return base64.b64encode(image_bytes).decode('utf-8')  
   
 def encode_pdf_from_blob(blob_client):  
+    # Blob からPDFを base64 エンコード  
     downloader = blob_client.download_blob()  
     pdf_bytes = downloader.readall()  
     return base64.b64encode(pdf_bytes).decode('utf-8')  
@@ -317,6 +332,7 @@ def get_authenticated_user():
     if "user_id" in session and "user_name" in session:  
         return session["user_id"]  
   
+    # Azure App Service Easy Auth（有効時）  
     client_principal = request.headers.get("X-MS-CLIENT-PRINCIPAL")  
     if client_principal:  
         try:  
@@ -341,6 +357,7 @@ def get_authenticated_user():
     return session["user_id"]  
   
 def save_chat_history():  
+    # Cosmos DB に履歴を保存  
     with lock:  
         try:  
             sidebar = session.get("sidebar_messages", [])  
@@ -515,7 +532,7 @@ def get_search_client(index_name):
         index_name=index_name,  
         credential=AzureKeyCredential(search_service_key),  
         transport=transport,  
-        api_version="2024-07-01"  
+        api_version="2024-07-01"  # 明示  
     )  
   
 def keyword_search(query, topNDocuments, index_name):  
@@ -691,6 +708,7 @@ def build_responses_input_with_history(all_messages, system_message, context_tex
             ]  
         })  
   
+    # user の最後に RAG コンテキストを追記  
     if context_text:  
         for idx in range(len(input_items) - 1, -1, -1):  
             if input_items[idx].get("role") == "user":  
@@ -968,7 +986,7 @@ def index():
     )  
   
 # -------------------------------  
-# メッセージ送信（OpenAI 呼び出し）  
+# メッセージ送信（JSON・フォールバック用）  
 # -------------------------------  
 @app.route('/send_message', methods=['POST'])  
 def send_message():  
@@ -1017,7 +1035,7 @@ def send_message():
             title = r.get('title', '不明')  
             content = r.get('content', '')  
   
-            # 1) filepath を最優先（前回動いていたロジック）  
+            # 1) filepath を最優先  
             fp = (r.get('filepath') or '').replace('\\', '/')  
             container, blobname = (None, None)  
             if fp:  
@@ -1177,6 +1195,273 @@ def send_message():
         )  
   
 # -------------------------------  
+# SSE ストリーミング ヘルパー  
+# -------------------------------  
+def _sse_event(event_name: str, data_obj) -> str:  
+    """SSE 1イベント（event: name, data: json）を生成（Flask がUTF-8へ変換）"""  
+    return f"event: {event_name}\ndata: {json.dumps(data_obj, ensure_ascii=False)}\n\n"  
+  
+# -------------------------------  
+# SSE ストリーミング エンドポイント  
+# -------------------------------  
+@app.route('/stream_message', methods=['GET'])  
+def stream_message():  
+    """  
+    SSE版のメッセージ送信。  
+    - クエリ ?prompt=... を受け取り、RAG検索結果を先に送信（event: search_files）  
+    - その後 Azure OpenAI Responses API を stream で呼び出し、delta を逐次 event: delta で送信  
+    - 最後に event: reasoning_summary, event: final（HTML）、event: done を送信  
+    - 初回トークンが遅い場合でも :keepalive を一定間隔で送出し接続維持  
+    """  
+    prompt = (request.args.get('prompt') or '').strip()  
+    if not prompt:  
+        return ("missing prompt", 400, {"Content-Type": "text/plain; charset=utf-8"})  
+  
+    # 直近のセッションにユーザー発話を追加（サーバ側履歴）  
+    messages = session.get("main_chat_messages", [])  
+    messages.append({"role": "user", "content": prompt, "type": "text"})  
+    session["main_chat_messages"] = messages  
+    session.modified = True  
+    save_chat_history()  
+  
+    # セッション依存の値はスレッドに渡すためにローカル変数に取り出す  
+    selected_index = session.get("selected_search_index", DEFAULT_SEARCH_INDEX)  
+    doc_count = max(1, min(300, int(session.get("doc_count", DEFAULT_DOC_COUNT))))  
+    history_to_send = session.get("history_to_send", MAX_HISTORY_TO_SEND)  
+  
+    # system_message の解決  
+    system_message = session.get("default_system_message", "")  
+    idx = session.get("current_chat_index", 0)  
+    sidebar = session.get("sidebar_messages", [])  
+    if sidebar and 0 <= idx < len(sidebar):  
+        system_message = sidebar[idx].get("system_message", system_message)  
+  
+    # 添付（画像・PDF）は最後の user メッセージに付与する  
+    image_filenames = list(session.get("image_filenames", []))  
+    file_filenames = list(session.get("file_filenames", []))  
+  
+    # モデル・reasoning 設定  
+    model_to_use = session.get("selected_model", RESPONSES_MODEL)  
+    effort = session.get("reasoning_effort", REASONING_EFFORT)  
+    if effort not in {"low", "medium", "high"}:  
+        effort = REASONING_EFFORT  
+    enable_reasoning = model_to_use in REASONING_ENABLED_MODELS  
+  
+    # ストリーム用のキューと共有結果  
+    q: "queue.Queue[str | None]" = queue.Queue(maxsize=100)  
+    done_event = threading.Event()  
+    result_holder = {  
+        "full_text": "",  
+        "assistant_html": "",  
+        "reasoning_summary": "",  
+        "search_files": [],  
+        "error": None  
+    }  
+  
+    @copy_current_request_context  
+    def producer():  
+        """RAG → OpenAIストリーミング → SSEキューへ投入（バックグラウンドスレッド）"""  
+        try:  
+            # 1) RAG検索（RRF + オーバーフェッチ）  
+            strictness = 0.0  
+            results_list = hybrid_search_multiqueries([prompt], doc_count, selected_index, strictness)  
+  
+            # 2) モデルに渡すコンテキスト生成（最大 50,000 文字）  
+            context = "\n".join([  
+                f"ファイル名: {r.get('title', '不明')}\n内容: {r.get('content','')}"  
+                for r in results_list  
+            ])[:50000]  
+  
+            # 3) UI用にドキュメントリンク（SAS/ダウンロード）を準備し、先に送信  
+            search_files = []  
+            for r in results_list:  
+                title = r.get('title', '不明')  
+                content = r.get('content', '')  
+                fp = (r.get('filepath') or '').replace('\\', '/')  
+                container, blobname = (None, None)  
+                if fp:  
+                    container, blobname = resolve_blob_from_filepath(selected_index, fp)  
+                else:  
+                    u = r.get('url') or ''  
+                    if is_azure_blob_url(u):  
+                        container, blobname = resolve_blob_from_filepath(selected_index, u)  
+  
+                url = ''  
+                if container and blobname:  
+                    try:  
+                        if blobname.lower().endswith('.txt'):  
+                            url = url_for('download_txt', container=container, blobname=quote(blobname))  
+                        else:  
+                            blob_client = blob_service_client.get_blob_client(container=container, blob=blobname)  
+                            url = generate_sas_url(blob_client, blobname)  
+                    except Exception as e:  
+                        print("SAS/ダウンロードURL生成エラー:", e)  
+  
+                search_files.append({'title': title, 'content': content, 'url': url})  
+  
+            result_holder["search_files"] = search_files  
+            q.put(_sse_event("search_files", search_files))  # 先に文書リストを送る  
+  
+            # 4) Responses API 入力構築（履歴＋system＋context）  
+            input_items = build_responses_input_with_history(  
+                all_messages=messages,  
+                system_message=system_message,  
+                context_text=context,  
+                max_history_to_send=history_to_send  
+            )  
+  
+            # 5) 添付付与（最後の user）  
+            last_user_index = None  
+            for i in range(len(input_items) - 1, -1, -1):  
+                if input_items[i].get("role") == "user":  
+                    last_user_index = i  
+                    break  
+  
+            if last_user_index is not None:  
+                # 画像（data URL）  
+                for img_name in image_filenames:  
+                    blob_client = image_container_client.get_blob_client(img_name)  
+                    try:  
+                        encoded = encode_image_from_blob(blob_client)  
+                        ext = img_name.rsplit('.', 1)[-1].lower()  
+                        mime = f"image/{'jpeg' if ext == 'jpg' else ext}" if ext in ['png', 'jpeg', 'jpg', 'gif'] else 'application/octet-stream'  
+                        data_url = f"data:{mime};base64,{encoded}"  
+                        input_items[last_user_index]["content"].append({"type": "input_image", "image_url": data_url})  
+                    except Exception as e:  
+                        print("画像エンコードエラー:", e)  
+                        traceback.print_exc()  
+  
+                # PDF（base64 埋め込み）  
+                for pdf_name in file_filenames:  
+                    if pdf_name.lower().endswith('.pdf'):  
+                        blob_client = file_container_client.get_blob_client(pdf_name)  
+                        try:  
+                            encoded = encode_pdf_from_blob(blob_client)  
+                            input_items[last_user_index]["content"].append({  
+                                "type": "input_file",  
+                                "filename": pdf_name,  
+                                "file_data": f"data:application/pdf;base64,{encoded}"  
+                            })  
+                        except Exception as e:  
+                            print("PDFエンコードエラー:", e)  
+                            traceback.print_exc()  
+  
+            # 6) モデル呼び出し（stream=True）  
+            request_kwargs = dict(model=model_to_use, input=input_items)  
+            if enable_reasoning:  
+                request_kwargs["reasoning"] = {"effort": effort}  
+  
+            # Azure OpenAI Responses API ストリーミング  
+            with client.responses.stream(**request_kwargs) as stream:  
+                for event in stream:  
+                    etype = getattr(event, "type", "")  
+                    # テキストのデルタ（増分）  
+                    if etype == "response.output_text.delta":  
+                        delta = getattr(event, "delta", "") or ""  
+                        if delta:  
+                            result_holder["full_text"] += delta  
+                            # クライアントへトークンを送出  
+                            q.put(_sse_event("delta", {"text": delta}))  
+                    # エラーイベント（あれば通知）  
+                    elif etype == "response.error":  
+                        err = getattr(event, "error", None)  
+                        msg = str(err) if err else "unknown error"  
+                        result_holder["error"] = msg  
+                        q.put(_sse_event("error", {"message": msg}))  
+  
+                # 応答確定  
+                final_response = stream.get_final_response()  
+                result_holder["reasoning_summary"] = extract_reasoning_summary(final_response)  
+  
+            # 7) HTML化して送出  
+            full_text = result_holder["full_text"]  
+            if full_text:  
+                assistant_html = markdown2.markdown(  
+                    full_text,  
+                    extras=["tables", "fenced-code-blocks", "code-friendly", "break-on-newline", "cuddled-lists"]  
+                )  
+            else:  
+                assistant_html = "<p>（応答テキストが空でした。もう一度お試しください）</p>"  
+  
+            result_holder["assistant_html"] = assistant_html  
+  
+            if result_holder["reasoning_summary"]:  
+                q.put(_sse_event("reasoning_summary", {"summary": result_holder["reasoning_summary"]}))  
+            q.put(_sse_event("final", {"html": assistant_html}))  
+        except Exception as e:  
+            print("SSE producer エラー:", e)  
+            traceback.print_exc()  
+            result_holder["error"] = str(e)  
+            q.put(_sse_event("error", {"message": str(e)}))  
+        finally:  
+            # ストリーム終了通知  
+            q.put(_sse_event("done", {}))  
+            q.put(None)  # 終了シグナル  
+            done_event.set()  
+  
+    def heartbeat():  
+        """:keepalive を一定間隔で送信（プロキシ／LBのアイドル切断を回避）"""  
+        while not done_event.is_set():  
+            try:  
+                q.put(":keepalive\n\n")  # SSEコメント。strでOK（Flask が bytes 化）  
+            except Exception:  
+                break  
+            time.sleep(12)  # 10～15秒程度が目安（環境に合わせて調整）  
+  
+    # バックグラウンドスレッド起動  
+    threading.Thread(target=producer, daemon=True).start()  
+    threading.Thread(target=heartbeat, daemon=True).start()  
+  
+    def generate():  
+        """SSEチャンクを順にクライアントへ送出。終了後に履歴を確定保存。"""  
+        # 接続直後にコメントで「接続完了」を流す（ブラウザやプロキシにフラッシュさせる）  
+        yield ":connected\n\n"  
+  
+        while True:  
+            chunk = q.get()  
+            if chunk is None:  
+                break  
+            # 逐次フラッシュ（str を yield。Flask が UTF-8 で bytes へ変換）  
+            yield chunk  
+  
+        # ここで最終結果をセッション/DBに保存（stream_with_context により request context が有効）  
+        try:  
+            if result_holder["assistant_html"] or result_holder["full_text"]:  
+                msgs = session.get("main_chat_messages", [])  
+                msgs.append({  
+                    "role": "assistant",  
+                    "content": result_holder["assistant_html"],  
+                    "type": "html",  
+                    "text": result_holder["full_text"]  
+                })  
+                session["main_chat_messages"] = msgs  
+                session.modified = True  
+  
+                idx2 = session.get("current_chat_index", 0)  
+                sidebar2 = session.get("sidebar_messages", [])  
+                if idx2 < len(sidebar2):  
+                    sidebar2[idx2]["messages"] = msgs  
+                    if not sidebar2[idx2].get("first_assistant_message"):  
+                        sidebar2[idx2]["first_assistant_message"] = result_holder["full_text"]  
+                    session["sidebar_messages"] = sidebar2  
+                    session.modified = True  
+  
+                save_chat_history()  
+        except Exception as e:  
+            print("SSE後処理の履歴保存エラー:", e)  
+            traceback.print_exc()  
+  
+    # ストリーミングレスポンス（direct_passthrough は指定しない）  
+    headers = {  
+        "Content-Type": "text/event-stream; charset=utf-8",  
+        "Cache-Control": "no-cache, no-transform",  # プロキシでの変換/キャッシュ抑止  
+        "X-Accel-Buffering": "no",                  # Nginxのレスポンスバッファリング無効化  
+        "Connection": "keep-alive"  
+    }  
+    # 重要: stream_with_context でジェネレーター実行中の request context を維持  
+    return app.response_class(stream_with_context(generate()), headers=headers)  
+  
+# -------------------------------  
 # テキスト Blob ダウンロード  
 # -------------------------------  
 @app.route("/download_txt/<container>/<path:blobname>")  
@@ -1207,4 +1492,5 @@ def download_txt(container, blobname):
 # エントリポイント  
 # -------------------------------  
 if __name__ == '__main__':  
+    # ローカル実行用。Azure App Service（Linux）では Gunicorn を推奨（例: gunicorn -w 1 -k gevent app:app）  
     app.run(debug=True, host='0.0.0.0')  
