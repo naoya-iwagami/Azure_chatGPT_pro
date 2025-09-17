@@ -55,10 +55,6 @@ from azure.storage.blob import (
 from openai import AzureOpenAI  
 import markdown2  
   
-# 企業プロキシ環境などでのアウトバウンド設定（必要な場合のみ）  
-os.environ['HTTP_PROXY'] = 'http://g3.konicaminolta.jp:8080'  
-os.environ['HTTPS_PROXY'] = 'http://g3.konicaminolta.jp:8080'  
-  
 # -------------------------------Azure OpenAI クライアント設定-------------------------------  
 # Responses 用クライアント（ストリーミング対応）  
 client = AzureOpenAI(  
