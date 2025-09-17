@@ -154,7 +154,29 @@ html, body {
 }  
 #searchFilesUlContainer .doc-num {  
     display: inline-block;  
-    width: 1.6em;       /* 2桁でもズレないよう固定幅 */  
+    width: 1.6em;   /* 2桁でもズレないよう固定幅 */  
     font-weight: 600;  
     color: #1563a6;  
+}  
+  
+/* クエリリライト表示 */  
+.rewritten-queries {  
+    margin-top: 6px;  
+    font-size: 0.9em;  
+    background: #fff8e6;  
+    border-left: 4px solid #f0ad4e;  
+    padding: 6px 10px;  
+    border-radius: 6px;  
+}  
+.rq-title {  
+    font-weight: 600;  
+    color: #8a6d3b;  
+    margin-bottom: 4px;  
+}  
+.rq-list {  
+    margin: 0;  
+    padding-left: 1.2em;  
+}  
+.rq-list li {  
+    margin-bottom: 2px;  
 }  

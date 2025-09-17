@@ -18,9 +18,9 @@
   
         /* 検索に利用された文書の一覧スクロール領域 */  
         #searchFilesUlContainer {  
-            max-height: 50vh;  /* 画面高の約半分までに制限 */  
-            overflow-y: auto;  /* 縦スクロールを有効化 */  
-            border: 1px solid #e0e0e0; /* 見やすいよう枠線 */  
+            max-height: 50vh;  
+            overflow-y: auto;  
+            border: 1px solid #e0e0e0;  
             background: #fff;  
             margin-top: .5rem;  
             padding: .5rem .75rem;  
@@ -301,12 +301,11 @@
   
 <script>  
 /*  
-  SSE（/stream_message）でストリーミング受信。  
-  - 初回トークンが遅い場合もサーバ側が :keepalive を送るので接続維持  
-  - ブラウザが EventSource 非対応なら従来の /send_message(JSON) にフォールバック  
+  二段階方式のSSE:  
+  1) /prepare_stream にPOSTして message_id を取得  
+  2) /stream_message?mid=... に EventSource で接続（URL長制限回避）  
 */  
 document.addEventListener('DOMContentLoaded', function() {  
-  // 入力欄保持  
   const promptTextarea = document.getElementById('promptTextarea');  
   if (sessionStorage.getItem('chat_input')) {  
     promptTextarea.value = sessionStorage.getItem('chat_input');  
@@ -325,6 +324,9 @@ document.addEventListener('DOMContentLoaded', function() {
   const searchFilesDisplay = document.getElementById('searchFilesDisplay');  
   let currentSearchFiles = [];  
   
+  // 直近のユーザーバブル（リライト表示に使う）  
+  let lastUserBubbleEl = null;  
+  
   function scrollChatToBottom() { chatBox.scrollTop = chatBox.scrollHeight; }  
   function escapeHtml(str) {  
     if (!str) return '';  
@@ -342,9 +344,57 @@ document.addEventListener('DOMContentLoaded', function() {
       </div>`;  
     chatBox.appendChild(c);  
     scrollChatToBottom();  
+    const bubble = c.querySelector('.message-bubble');  
+    lastUserBubbleEl = bubble;  
+    return bubble;  
   }  
   
-  // ストリーミング用の空メッセージバブルを作成し、その要素を返す  
+  // 任意改善版: リライト結果をユーザーメッセージ直下に表示（base_query と needs_clarification を利用）  
+  function renderRewrittenQueriesUnder(targetBubbleEl, payload) {  
+    try {  
+      if (!targetBubbleEl) return;  
+      const queries = Array.isArray(payload?.queries)  
+        ? payload.queries.map(s => typeof s === 'string' ? s.trim() : '').filter(Boolean)  
+        : [];  
+      if (queries.length === 0) return;  
+  
+      const baseQuery = (typeof payload?.base_query === 'string' ? payload.base_query.trim() : '');  
+      const clarify = payload?.needs_clarification === true;  
+  
+      // 既存があれば置き換え  
+      const old = targetBubbleEl.querySelector('.rewritten-queries');  
+      if (old) old.remove();  
+  
+      const wrap = document.createElement('div');  
+      wrap.className = 'rewritten-queries';  
+      const title = document.createElement('div');  
+      title.className = 'rq-title';  
+      title.textContent = clarify  
+        ? 'クエリリライト（検索に使用・要確認の可能性）'  
+        : 'クエリリライト（検索に使用）';  
+      const list = document.createElement('ul');  
+      list.className = 'rq-list';  
+  
+      // 基準クエリ（重複しない場合のみ先頭に表示）  
+      if (baseQuery && !queries.includes(baseQuery)) {  
+        const li0 = document.createElement('li');  
+        li0.textContent = baseQuery + '（基準）';  
+        list.appendChild(li0);  
+      }  
+  
+      queries.forEach(q => {  
+        const li = document.createElement('li');  
+        li.textContent = q;  
+        list.appendChild(li);  
+      });  
+  
+      wrap.appendChild(title);  
+      wrap.appendChild(list);  
+      targetBubbleEl.appendChild(wrap);  
+      scrollChatToBottom();  
+    } catch (_) {}  
+  }  
+  
   function appendAssistantStreamContainer() {  
     const c = document.createElement('div');  
     c.className = 'message-container assistant';  
@@ -397,7 +447,7 @@ document.addEventListener('DOMContentLoaded', function() {
     currentSearchFiles = [];  
   }  
   
-  // RAG文書の一覧描画（クリックで展開/ダウンロード対応）  
+  // RAG文書の一覧描画  
   function renderSearchFiles(files) {  
     if (!Array.isArray(files) || files.length === 0) {  
       clearSearchFilesDisplay();  
@@ -429,76 +479,91 @@ document.addEventListener('DOMContentLoaded', function() {
     }, 50);  
   }  
   
-  // SSE開始  
+  // 二段階SSE開始（長文対応）  
   function startSSE(prompt) {  
-    // EventSource は GET のみなのでクエリに積む  
-    const esUrl = '/stream_message?prompt=' + encodeURIComponent(prompt);  
-    const streamEl = appendAssistantStreamContainer();  // ストリーム用コンテナの要素参照を保持  
-    let accText = '';                                   // サーバからの増分を累積  
+    const streamEl = appendAssistantStreamContainer();  
+    let accText = '';  
   
     sendButton.disabled = true;  
     showLoading();  
     clearSearchFilesDisplay();  
   
-    const es = new EventSource(esUrl);  
+    // 1) まずPOSTで長文promptを送る  
+    fetch('/prepare_stream', {  
+      method: 'POST',  
+      headers: {'Content-Type': 'application/json'},  
+      body: JSON.stringify({ prompt })  
+    })  
+    .then(r => {  
+      if (!r.ok) throw new Error('prepare_stream failed');  
+      return r.json();  
+    })  
+    .then(({ message_id }) => {  
+      if (!message_id) throw new Error('no message_id');  
   
-    es.addEventListener('search_files', ev => {  
-      try {  
-        const data = JSON.parse(ev.data);  
-        renderSearchFiles(data);  
-      } catch (_) {}  
-    });  
+      // 2) SSE開始（短いIDのみクエリに付与）  
+      const es = new EventSource('/stream_message?mid=' + encodeURIComponent(message_id));  
   
-    es.addEventListener('delta', ev => {  
-      try {  
-        const data = JSON.parse(ev.data);  
-        if (data && typeof data.text === 'string') {  
-          accText += data.text;  
-          updateAssistantContainerText(streamEl, accText); // 要素参照に対して更新  
-        }  
-      } catch (_) {}  
-    });  
+      es.addEventListener('rewritten_queries', ev => {  
+        try { renderRewrittenQueriesUnder(lastUserBubbleEl, JSON.parse(ev.data)); } catch (_) {}  
+      });  
   
-    es.addEventListener('final', ev => {  
-      try {  
-        const data = JSON.parse(ev.data);  
-        if (data && typeof data.html === 'string') {  
-          replaceAssistantContainerHtml(streamEl, data.html); // 要素参照に対して置換  
-        }  
-      } catch (_) {}  
-    });  
+      es.addEventListener('search_files', ev => {  
+        try { renderSearchFiles(JSON.parse(ev.data)); } catch (_) {}  
+      });  
   
-    es.addEventListener('reasoning_summary', ev => {  
-      try {  
-        const data = JSON.parse(ev.data);  
-        if (data && typeof data.summary === 'string' && data.summary) {  
-          appendReasoningSummary(data.summary);  
-        }  
-      } catch (_) {}  
-    });  
+      es.addEventListener('delta', ev => {  
+        try {  
+          const data = JSON.parse(ev.data);  
+          if (data && typeof data.text === 'string') {  
+            accText += data.text;  
+            updateAssistantContainerText(streamEl, accText);  
+          }  
+        } catch (_) {}  
+      });  
   
-    es.addEventListener('error', ev => {  
-      // サーバからの error イベント（アプリレベル）  
-      try {  
-        const data = JSON.parse(ev.data);  
-        console.error('SSE error event:', data);  
-      } catch (_) {}  
-    });  
+      es.addEventListener('final', ev => {  
+        try {  
+          const data = JSON.parse(ev.data);  
+          if (data && typeof data.html === 'string') {  
+            replaceAssistantContainerHtml(streamEl, data.html);  
+          }  
+        } catch (_) {}  
+      });  
   
-    es.addEventListener('done', ev => {  
-      es.close();  
+      es.addEventListener('reasoning_summary', ev => {  
+        try {  
+          const data = JSON.parse(ev.data);  
+          if (data && typeof data.summary === 'string' && data.summary) {  
+            appendReasoningSummary(data.summary);  
+          }  
+        } catch (_) {}  
+      });  
+  
+      es.addEventListener('error', ev => {  
+        try { console.error('SSE error event:', JSON.parse(ev.data)); } catch (_) {}  
+      });  
+  
+      es.addEventListener('done', ev => {  
+        es.close();  
+        sendButton.disabled = false;  
+        hideLoading();  
+        scrollChatToBottom();  
+      });  
+  
+      es.onerror = function(err) {  
+        console.error('SSE connection error:', err);  
+        es.close();  
+        sendButton.disabled = false;  
+        hideLoading();  
+      };  
+    })  
+    .catch(err => {  
+      console.error(err);  
       sendButton.disabled = false;  
       hideLoading();  
-      scrollChatToBottom();  
+      alert('送信に失敗しました');  
     });  
-  
-    es.onerror = function(err) {  
-      // ネットワーク／プロキシ経由のエラー（自動再接続は不要なので閉じる）  
-      console.error('SSE connection error:', err);  
-      es.close();  
-      sendButton.disabled = false;  
-      hideLoading();  
-    };  
   }  
   
   // 既存の fetch(JSON) へのフォールバック（EventSource 非対応時用）  
@@ -514,6 +579,9 @@ document.addEventListener('DOMContentLoaded', function() {
     })  
     .then(r => r.json())  
     .then(data => {  
+      if (Array.isArray(data.rewritten_queries)) {  
+        renderRewrittenQueriesUnder(lastUserBubbleEl, { queries: data.rewritten_queries });  
+      }  
       if (data.response) {  
         appendAssistantMessage(data.response);  
       }  
@@ -539,7 +607,8 @@ document.addEventListener('DOMContentLoaded', function() {
     e.preventDefault();  
     const prompt = promptTextarea.value.trim();  
     if (!prompt) return;  
-    appendUserMessage(prompt);  
+    const bubble = appendUserMessage(prompt); // ユーザー発話の直下にリライト結果を差し込むため参照を保持  
+    lastUserBubbleEl = bubble;  
     promptTextarea.value = '';  
   
     if (window.EventSource) {  
@@ -588,7 +657,7 @@ document.addEventListener('DOMContentLoaded', function() {
   });  
   
   // 初期スクロール  
-  (function scrollChatToBottomOnLoad(){ chatBox.scrollTop = chatBox.scrollHeight; })();  
+  (function(){ chatBox.scrollTop = chatBox.scrollHeight; })();  
 });  
 </script>  
 </body>  
