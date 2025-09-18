@@ -1,7 +1,8 @@
 #!/usr/bin/env python3  
 # -*- coding: utf-8 -*-  
+  
 """  
-PM Compass – Flask アプリ（PDFアップロード＆分析対応版, 埋め込み分離 + RRFオーバーフェッチ対応 + SSEストリーミング対応, 強化クエリリライト版）  
+PM Compass – Flask アプリ（PDFアップロード＆分析対応版, 埋め込み分離 + RRFオーバーフェッチ対応 + SSEストリーミング対応, シンプルクエリリライト版）  
   
 主な機能:  
 - Azure OpenAI Responses API を使用（system 役割、会話履歴、reasoning 対応, ストリーミング対応）  
@@ -12,14 +13,14 @@ PM Compass – Flask アプリ（PDFアップロード＆分析対応版, 埋め
 - 画像/PDF アップロード（画像: input_image, PDF: input_file）に対応  
 - Cosmos DB にチャット履歴・指示テンプレートを保存/読込/削除  
 - 検索結果（search_files）をフロントで番号付き表示し、SASリンクやテキストダウンロードも提供  
-- 新規: SSE によるストリーミング出力（/stream_message）  
-- 新規: クエリリライト強化（キーワード重視CQR + variants 多様化 + HyDE/PRFフォールバック）  
-- 新規: リライト時に過去N発話（MAX_REWRITE_TURNS）も考慮  
+- SSE によるストリーミング出力（/stream_message）  
+- クエリリライトをシンプル化（会話履歴 + 最新発話から日本語の検索用クエリを1本のみ生成、Responses API使用）  
   
 本版のポイント:  
-- クエリリライトを「キーワード重視CQR（must/should/negatives + dense/sparse）」に強化  
-- 生成した must_keywords を constraints.must_include に反映し、検索クエリに強制付与（重要語の落ち漏れ抑止）  
-- おすすめ変更の反映: 実検索クエリ本数を MAX_REWRITE_QUERIES で厳密制御（variants=0許容）し、SSEで base_query を送らない  
+- クエリリライトは「1本のみのシンプルな検索クエリ」を Responses API で生成  
+- リライト用のシステムメッセージは使用しない  
+- リライト用モデルは gpt-4o を固定で使用  
+- 旧来の rewrite_query_json と関連ヘルパー・環境変数は廃止  
 """  
   
 import os  
@@ -31,80 +32,80 @@ import base64
 import threading  
 import datetime  
 import traceback  
-import time  # SSEの心拍用  
-import queue  # SSEの非同期キュー  
+import time  
+import queue  
 from urllib.parse import quote, unquote, urlparse  
   
 from flask import (  
-    Flask, request, render_template, redirect, url_for, session,  
-    flash, send_file, stream_with_context, jsonify  
+    Flask,  
+    request,  
+    render_template,  
+    redirect,  
+    url_for,  
+    session,  
+    flash,  
+    send_file,  
+    stream_with_context,  
+    jsonify,  
 )  
 from flask import copy_current_request_context  
-from flask_session import Session  # pip install Flask-Session  
+from flask_session import Session  
 from werkzeug.utils import secure_filename  
   
-# Azure / OpenAI 関連  
 import certifi  
 from azure.core.credentials import AzureKeyCredential  
 from azure.core.pipeline.transport import RequestsTransport  
 from azure.search.documents import SearchClient  
 from azure.cosmos import CosmosClient  
-from azure.storage.blob import (  
-    BlobServiceClient, generate_blob_sas, BlobSasPermissions  
-)  
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions  
 from openai import AzureOpenAI  
 import markdown2  
+
+os.environ['HTTP_PROXY'] = 'http://g3.konicaminolta.jp:8080'
+os.environ['HTTPS_PROXY'] = 'http://g3.konicaminolta.jp:8080'
   
-# -------------------------------Azure OpenAI クライアント設定-------------------------------  
-# Responses 用クライアント（ストリーミング対応）  
+# ------------------------------- Azure OpenAI クライアント設定 -------------------------------  
 client = AzureOpenAI(  
     api_key=os.getenv("AZURE_OPENAI_KEY"),  
     base_url=os.getenv("AZURE_OPENAI_ENDPOINT"),  
     api_version="preview",  
-    default_headers={"x-ms-include-response-reasoning-summary": "true"}  
+    default_headers={"x-ms-include-response-reasoning-summary": "true"},  
 )  
   
-# 埋め込み用クライアント（別の Azure OpenAI リソース/バージョンに切替可）  
 embed_endpoint = os.getenv("AZURE_OPENAI_EMBED_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")  
 embed_client = AzureOpenAI(  
     api_key=os.getenv("AZURE_OPENAI_KEY"),  
     azure_endpoint=embed_endpoint,  
-    api_version="2025-04-01-preview"  
+    api_version="2025-04-01-preview",  
 )  
   
-# モデル・埋め込み・検索設定  
+# ------------------------------- モデル・検索設定 -------------------------------  
 RESPONSES_MODEL = os.getenv("AZURE_OPENAI_RESPONSES_MODEL", "gpt-4o")  
 REASONING_ENABLED_MODELS = set(  
     m.strip() for m in os.getenv("REASONING_ENABLED_MODELS", "o3,o4-mini,gpt-5,o4").split(",") if m.strip()  
 )  
 REASONING_EFFORT = os.getenv("REASONING_EFFORT", "high")  
   
-# Azure OpenAI の埋め込みは「デプロイ名」を指定（環境変数で上書き可）  
 EMBEDDING_MODEL = os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT", "text-embedding-3-large")  
 VECTOR_FIELD = "contentVector"  
   
-MAX_HISTORY_TO_SEND = int(os.getenv("MAX_HISTORY_TO_SEND", "10"))  # 1～50  
-DEFAULT_DOC_COUNT = int(os.getenv("DEFAULT_DOC_COUNT", "10"))  # 1～300  
+MAX_HISTORY_TO_SEND = int(os.getenv("MAX_HISTORY_TO_SEND", "10"))  
+DEFAULT_DOC_COUNT = int(os.getenv("DEFAULT_DOC_COUNT", "10"))  
   
-# RRF オーバーフェッチ設定  
 RRF_FETCH_MULTIPLIER = float(os.getenv("RRF_FETCH_MULTIPLIER", "3.0"))  
 RRF_FETCH_MAX_TOP = int(os.getenv("RRF_FETCH_MAX_TOP", "300"))  
   
-# 親ドキュメントごとのチャンク採択上限（0=無制限）  
 MAX_CHUNKS_PER_PARENT = int(os.getenv("MAX_CHUNKS_PER_PARENT", "0"))  
   
-# クエリリライト設定  
-QUERY_REWRITE_ENABLED = os.getenv("QUERY_REWRITE_ENABLED", "1") not in ("0", "false", "False")  
-MAX_REWRITE_QUERIES = max(1, min(8, int(os.getenv("MAX_REWRITE_QUERIES", "1"))))  # 実務: 3〜5本が妥当  
+REWRITE_MODEL = "gpt-4.1"  # 固定  
 MAX_REWRITE_TURNS = max(1, min(8, int(os.getenv("MAX_REWRITE_TURNS", "4"))))  
   
-# フォールバック（HyDE/PRF）の有効化と閾値  
 ENABLE_HYDE = os.getenv("ENABLE_HYDE", "1") not in ("0", "false", "False")  
 ENABLE_PRF = os.getenv("ENABLE_PRF", "1") not in ("0", "false", "False")  
-RECALL_PARENT_THRESHOLD_FRACTION = float(os.getenv("RECALL_PARENT_THRESHOLD_FRACTION", "0.4"))  # doc_countの40%未満なら不足  
+RECALL_PARENT_THRESHOLD_FRACTION = float(os.getenv("RECALL_PARENT_THRESHOLD_FRACTION", "0.4"))  
 MIN_UNIQUE_PARENTS_ABS = int(os.getenv("MIN_UNIQUE_PARENTS_ABS", "3"))  
   
-# -------------------------------Flask アプリ設定-------------------------------  
+# ------------------------------- Flask アプリ設定 -------------------------------  
 app = Flask(__name__)  
 app.secret_key = os.getenv('FLASK_SECRET_KEY', 'your-default-secret-key')  
 app.config['SESSION_TYPE'] = 'filesystem'  
@@ -113,7 +114,7 @@ app.config['SESSION_PERMANENT'] = False
 os.makedirs(app.config['SESSION_FILE_DIR'], exist_ok=True)  
 Session(app)  
   
-# -------------------------------Azure サービスクライアント-------------------------------  
+# ------------------------------- Azure サービスクライアント -------------------------------  
 search_service_endpoint = os.getenv("AZURE_SEARCH_ENDPOINT")  
 search_service_key = os.getenv("AZURE_SEARCH_KEY")  
 transport = RequestsTransport(verify=certifi.where())  
@@ -122,18 +123,21 @@ cosmos_endpoint = os.getenv("AZURE_COSMOS_ENDPOINT")
 cosmos_key = os.getenv("AZURE_COSMOS_KEY")  
 database_name = 'chatdb'  
 container_name = 'personalchats'  
-cosmos_client = CosmosClient(cosmos_endpoint, credential=cosmos_key)  
-database = cosmos_client.get_database_client(database_name)  
-container = database.get_container_client(container_name)  
+cosmos_client = CosmosClient(cosmos_endpoint, credential=cosmos_key) if cosmos_endpoint and cosmos_key else None  
+if cosmos_client:  
+    database = cosmos_client.get_database_client(database_name)  
+    container = database.get_container_client(container_name)  
+else:  
+    database = None  
+    container = None  
   
 blob_connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")  
-blob_service_client = BlobServiceClient.from_connection_string(blob_connection_string)  
+blob_service_client = BlobServiceClient.from_connection_string(blob_connection_string) if blob_connection_string else None  
 image_container_name = 'chatgpt-image'  
-image_container_client = blob_service_client.get_container_client(image_container_name)  
+image_container_client = blob_service_client.get_container_client(image_container_name) if blob_service_client else None  
 file_container_name = 'chatgpt-files'  
-file_container_client = blob_service_client.get_container_client(file_container_name)  
+file_container_client = blob_service_client.get_container_client(file_container_name) if blob_service_client else None  
   
-# UI で選択するインデックス（表示名 → インデックス名）  
 INDEX_OPTIONS = [  
     ("通常データ", "filetest11-large"),  
     ("SANUQIメール", "filetest13"),  
@@ -147,7 +151,6 @@ INDEX_OPTIONS = [
 INDEX_VALUES = {v for (_, v) in INDEX_OPTIONS}  
 DEFAULT_SEARCH_INDEX = INDEX_OPTIONS[0][1]  
   
-# インデックス名 → Blobコンテナ名  
 INDEX_TO_BLOB_CONTAINER = {  
     "filetest11-large": "filetest11",  
     "filetest13": "filetest13",  
@@ -160,7 +163,6 @@ INDEX_TO_BLOB_CONTAINER = {
 }  
 DEFAULT_BLOB_CONTAINER_FOR_SEARCH = INDEX_TO_BLOB_CONTAINER.get(DEFAULT_SEARCH_INDEX, "filetest11")  
   
-# インデックス名 → 言語（検索クエリのターゲット言語）  
 INDEX_LANG = {  
     "filetest11-large": "ja",  
     "filetest13": "ja",  
@@ -169,18 +171,21 @@ INDEX_LANG = {
     "filetest16": "ja",  
     "filetest17": "ja",  
     "filetest18": "ja",  
-    "quality-assurance": "ja"  
+    "quality-assurance": "ja",  
 }  
+  
+  
 def to_query_language(lang: str) -> str:  
     return "ja-JP" if (lang or "").lower().startswith("ja") else "en-US"  
   
-# スレッドロック  
+  
 lock = threading.Lock()  
   
-# -------------------------------ユーティリティ-------------------------------  
+# ------------------------------- ユーティリティ -------------------------------  
 def extract_account_key(connection_string: str) -> str:  
     pairs = [s.split("=", 1) for s in connection_string.split(";") if "=" in s]  
     return dict(pairs).get("AccountKey")  
+  
   
 def generate_sas_url(blob_client, blob_name):  
     connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")  
@@ -198,15 +203,18 @@ def generate_sas_url(blob_client, blob_name):
     )  
     return f"{blob_client.url}?{sas_token}"  
   
+  
 def encode_image_from_blob(blob_client):  
     downloader = blob_client.download_blob()  
     image_bytes = downloader.readall()  
     return base64.b64encode(image_bytes).decode('utf-8')  
   
+  
 def encode_pdf_from_blob(blob_client):  
     downloader = blob_client.download_blob()  
     pdf_bytes = downloader.readall()  
     return base64.b64encode(pdf_bytes).decode('utf-8')  
+  
   
 def strip_html_tags(html: str) -> str:  
     if not html:  
@@ -215,6 +223,7 @@ def strip_html_tags(html: str) -> str:
     html = re.sub(r'</p\s*>', '\n', html, flags=re.I)  
     text = re.sub(r'<[^>]+>', '', html)  
     return text  
+  
   
 def extract_reasoning_summary(resp) -> str:  
     try:  
@@ -230,7 +239,6 @@ def extract_reasoning_summary(resp) -> str:
                 for s in out.get("summary", []):  
                     if isinstance(s, dict) and s.get("text"):  
                         return s["text"]  
-  
         reasoning = getattr(resp, "reasoning", None)  
         if reasoning:  
             summ = getattr(reasoning, "summary", None)  
@@ -244,13 +252,13 @@ def extract_reasoning_summary(resp) -> str:
         print("Reasoning summary 取得エラー:", e)  
     return ""  
   
+  
 def extract_output_text(resp) -> str:  
     try:  
         if hasattr(resp, "output_text") and resp.output_text:  
             return resp.output_text  
         if isinstance(resp, dict) and resp.get("output_text"):  
             return resp["output_text"]  
-  
         text_parts = []  
         out_arr = getattr(resp, "output", None)  
         if out_arr is None and isinstance(resp, dict):  
@@ -272,6 +280,7 @@ def extract_output_text(resp) -> str:
         traceback.print_exc()  
         return ""  
   
+  
 def is_azure_blob_url(u: str) -> bool:  
     if not u:  
         return False  
@@ -284,10 +293,10 @@ def is_azure_blob_url(u: str) -> bool:
     except Exception:  
         return False  
   
+  
 def resolve_blob_from_filepath(selected_index: str, path_or_url: str):  
     if not path_or_url:  
         return None, None  
-  
     s = path_or_url.strip().replace("\\", "/")  
     if s.startswith("http://") or s.startswith("https://"):  
         if not is_azure_blob_url(s):  
@@ -299,200 +308,37 @@ def resolve_blob_from_filepath(selected_index: str, path_or_url: str):
                 return parts[0], parts[1]  
         except Exception:  
             return None, None  
-  
     container = INDEX_TO_BLOB_CONTAINER.get(selected_index, DEFAULT_BLOB_CONTAINER_FOR_SEARCH)  
     blobname = s.lstrip("/")  
     if container and blobname.startswith(container + "/"):  
         blobname = blobname[len(container) + 1:]  
     return container, blobname  
   
-# -------------------------------クエリリライト（検索向けキーワード列 + variants）-------------------------------  
-def _norm_line(s: str) -> str:  
-    s = (s or "").strip()  
-    s = re.sub(r"^[「『【]+", "", s)  
-    s = re.sub(r"[」『】]+$", "", s)  
-    s = s.strip("：:。.")  
-    return s.strip()  
   
-def _parse_json_relaxed(text: str) -> dict:  
-    try:  
-        return json.loads(text)  
-    except Exception:  
-        try:  
-            start = text.find("{")  
-            end = text.rfind("}")  
-            if start != -1 and end != -1 and end > start:  
-                return json.loads(text[start:end+1])  
-        except Exception:  
-            return {}  
-    return {}  
+# ------------------------------- クエリリライト（シンプル版：1本のみ、Responses API） -------------------------------  
+def rewrite_query(user_input: str, recent_messages: list) -> str:  
+    prompt = (  
+        "あなたは有能な検索アシスタントです。\n"  
+        "以下の会話履歴とユーザーの最新質問をもとに、検索エンジンに適した簡潔で明確な日本語クエリを1つだけ生成してください。\n"  
+        "不要な会話表現や雑談は除外し、検索意図を正確に反映したキーワードやフレーズを含めてください。\n"  
+        "【会話履歴】\n"  
+    )  
+    for msg in (recent_messages or []):  
+        prompt += f"- {msg}\n"  
+    prompt += f"【ユーザー質問】\n{user_input}\n"  
+    prompt += "【検索用クエリ】"  
   
-def _force_keyword_style(s: str) -> str:  
-    """  
-    文っぽい出力を検索クエリ向けの短いキーワード列に寄せる簡易整形。  
-    - 句読点/括弧などを除去  
-    - よくある冗長語尾・説明語を削る  
-    - 連続空白を圧縮  
-    - 最大18トークンに制限（← 12から拡張）  
-    """  
-    if not s:  
-        return ""  
-    s = s.replace("　", " ")  
-    s = re.sub(r"[。、「」『』（）()【】［］…，．、・]+", " ", s)  
-    s = re.sub(r"(とは何ですか|とは|について|を教えて(ください)?|の方法|の手順|の違い|違い|比較|使い方|概要|まとめ)$", "", s)  
-    stop = {"です", "ます", "する", "したい", "ください", "こと", "もの", "ため", "場合", "など", "について", "とは"}  
-    toks = [t for t in re.split(r"\s+", s.strip()) if t and t not in stop]  
-    return " ".join(toks[:18])  
+    input_items = [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}]  
+    resp = client.responses.create(model=REWRITE_MODEL, input=input_items, temperature=0, max_output_tokens=128)  
+    rewritten = (extract_output_text(resp) or "").strip()  
+    rewritten = rewritten.splitlines()[0].strip().strip('「」"\' 　')  
+    return rewritten  
   
-def rewrite_query_json(user_input: str, recent_messages: list[str], num_variants: int = 3) -> dict:  
-    """  
-    会話を『キーワード重視のCQR』で展開しつつ、既存パイプライン互換の  
-    query / variants / constraints にマップして返す。  
-    - 内部では must_keywords / should_keywords / negatives / dense_queries を生成  
-    - query は dense_queries[0] + must/should を織り込んだキーワード列  
-    - variants は残りの dense_queries を同様に整形して使用（0本も可）  
-    """  
-    if not QUERY_REWRITE_ENABLED:  
-        return {  
-            "query": _force_keyword_style(user_input),  
-            "variants": [],  
-            "constraints": {},  
-            "language": "ja",  
-            "needs_clarification": False  
-        }  
   
-    def _uniq_keep(seq):  
-        return list(dict.fromkeys([x for x in (seq or []) if isinstance(x, str) and x.strip()]))  
-  
-    def _to_tokens(s):  
-        return [t for t in re.split(r"\s+", (s or "").strip()) if t]  
-  
-    def _mk_kw_query(seed: str, must: list[str], should: list[str], limit: int = 18) -> str:  
-        # seed（denseの1本）をベースに must を最優先、次に seed の語、最後に should を追加  
-        toks = []  
-        toks.extend(_to_tokens(" ".join(must)))  
-        toks.extend(_to_tokens(seed))  
-        toks.extend(_to_tokens(" ".join(should[:20])))  
-        toks = _uniq_keep(toks)  
-        return " ".join(toks[:limit])  
-  
-    try:  
-        hist = "\n".join(f"- {m}" for m in (recent_messages or []))  
-  
-        # キーワード重視クエリ展開器（CQR）  
-        sys_prompt = (  
-            "あなたはRAG検索のための『キーワード重視クエリ展開器』です。"  
-            "要約やタイトル化は禁止。現在の発話と会話履歴から、具体的な語を最大限抽出・展開し、"  
-            "must_keywords / should_keywords / negatives と dense/sparse クエリを生成します。"  
-            "必ず守ること:\n"  
-            "- 固有名詞/API名/関数名/設定キー/ファイル名/エラーコード/数値/バージョン/OS/ランタイム/FW/ライブラリ/略称を失わない\n"  
-            "- 日本語/英語/ローマ字/カナ/全角半角/ハイフン有無/CamelCase・snake_case等の表記揺れを含める\n"  
-            "- 直近発話のみで要約しない。会話履歴全体から拾う\n"  
-            "- 同義語への置換は最小限。原文の表層形を優先\n"  
-            "- JSONのみ出力。解説や余計な文字は禁止"  
-        )  
-  
-        user_prompt = f"""  
-以下の「会話履歴」と「現在の発話」から検索用の語とクエリを作成してください。  
-  
-[会話履歴]  
-{hist}  
-  
-[現在の発話]  
-{user_input}  
-  
-出力フォーマット（JSON, UTF-8, keys順は固定）:  
-{{  
-  "must_keywords": ["...", "..."],          // 3〜10個。照合に必須の具体語  
-  "should_keywords": ["...", "..."],        // 20〜60個。表記揺れ・同義・拡張を含む  
-  "negatives": ["...", "..."],              // 任意  
-  "dense_queries": ["...", "...", "..."],   // 3〜6本。側面が異なる自然文風キーワード列  
-  "sparse_queries": ["...", "..."]          // 1〜3本。BM25/ES向けの (A OR A') AND (B OR B')  
-}}  
-制約:  
-- 具体語を落とさない。抽象化/タイトル化しない  
-- 同一概念の表記揺れ（例: "PostgreSQL", "Postgres", "PG"）はshould_keywordsにすべて入れる  
-- dense_queriesは互いに視点が被り過ぎないよう多様化（機能/エラー/環境/データ/操作/設定など）  
-- sparse_queriesはAND/ORと括弧で束ねる（後段BM25/ES用）  
-        """.strip()  
-  
-        input_items = [  
-            {"role": "system", "content": [{"type": "input_text", "text": sys_prompt}]},  
-            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},  
-        ]  
-  
-        resp = client.responses.create(  
-            model=RESPONSES_MODEL,  
-            input=input_items,  
-            temperature=0.1,  
-            max_output_tokens=700  
-        )  
-        raw = (extract_output_text(resp) or "").strip()  
-        spec = _parse_json_relaxed(raw) or {}  
-  
-        must = _uniq_keep(spec.get("must_keywords", []))  
-        should = _uniq_keep(spec.get("should_keywords", []))  
-        negatives = _uniq_keep(spec.get("negatives", []))  
-        dense = _uniq_keep(spec.get("dense_queries", []))  
-  
-        # フォールバック（CQRが空なら従来に戻す）  
-        if not dense and not must and not should:  
-            return {  
-                "query": _force_keyword_style(user_input),  
-                "variants": [],  
-                "constraints": {},  
-                "language": "ja",  
-                "needs_clarification": False  
-            }  
-  
-        # query/variants へマッピング（既存パイプライン互換）  
-        main_seed = dense[0] if dense else user_input  
-        # ← 0本も許容する  
-        variants_seed = dense[1:1 + max(0, min(5, num_variants))]  
-  
-        main_q = _mk_kw_query(_force_keyword_style(_norm_line(main_seed)), must, should, limit=18)  
-        var_qs = [  
-            _mk_kw_query(_force_keyword_style(_norm_line(v)), must, should, limit=18)  
-            for v in variants_seed  
-        ]  
-        var_qs = _uniq_keep([v for v in var_qs if v and v != main_q])  
-  
-        obj = {  
-            "query": main_q,  
-            "variants": var_qs,  
-            "constraints": {  
-                "must_include": must,          # 既存の強制付与ロジックに載る  
-                "must_not_include": negatives, # 今は未使用でも保持  
-                "time_range": None  
-            },  
-            "language": "ja",  
-            "needs_clarification": False,  
-            "cqr": {  # 参考としてCQR全体を返す（未使用なら無害）  
-                "must_keywords": must,  
-                "should_keywords": should,  
-                "negatives": negatives,  
-                "dense_queries": dense,  
-                "sparse_queries": _uniq_keep(spec.get("sparse_queries", []))  
-            }  
-        }  
-        return obj  
-  
-    except Exception as e:  
-        print("rewrite_query_json エラー(CQR):", e)  
-        traceback.print_exc()  
-        return {  
-            "query": _force_keyword_style(user_input),  
-            "variants": [],  
-            "constraints": {},  
-            "language": "ja",  
-            "needs_clarification": False  
-        }  
-  
-# -------------------------------認証/履歴/指示テンプレート-------------------------------  
+# ------------------------------- 認証/履歴/指示テンプレート -------------------------------  
 def get_authenticated_user():  
     if "user_id" in session and "user_name" in session:  
         return session["user_id"]  
-  
     client_principal = request.headers.get("X-MS-CLIENT-PRINCIPAL")  
     if client_principal:  
         try:  
@@ -511,12 +357,14 @@ def get_authenticated_user():
             return user_id  
         except Exception as e:  
             print("Easy Auth ユーザー情報の取得エラー:", e)  
-  
     session["user_id"] = "anonymous@example.com"  
     session["user_name"] = "anonymous"  
     return session["user_id"]  
   
+  
 def save_chat_history():  
+    if not container:  
+        return  
     with lock:  
         try:  
             sidebar = session.get("sidebar_messages", [])  
@@ -532,7 +380,9 @@ def save_chat_history():
                     'user_name': user_name,  
                     'session_id': session_id,  
                     'messages': current.get("messages", []),  
-                    'system_message': current.get("system_message", session.get("default_system_message", "あなたは親切なAIアシスタントです…")),  
+                    'system_message': current.get(  
+                        "system_message", session.get("default_system_message", "あなたは親切なAIアシスタントです…")  
+                    ),  
                     'first_assistant_message': current.get("first_assistant_message", ""),  
                     'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat()  
                 }  
@@ -541,30 +391,33 @@ def save_chat_history():
             print("チャット履歴保存エラー:", e)  
             traceback.print_exc()  
   
+  
 def load_chat_history():  
+    if not container:  
+        return []  
     with lock:  
         user_id = get_authenticated_user()  
         sidebar_messages = []  
         try:  
             one_week_ago = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)).isoformat()  
-            query = """SELECT * FROM c  
- WHERE c.user_id = @user_id AND c.timestamp >= @one_week_ago  
- ORDER BY c.timestamp DESC"""  
+            query = """  
+            SELECT * FROM c  
+            WHERE c.user_id = @user_id AND c.timestamp >= @one_week_ago  
+            ORDER BY c.timestamp DESC  
+            """  
             parameters = [  
                 {"name": "@user_id", "value": user_id},  
-                {"name": "@one_week_ago", "value": one_week_ago}  
+                {"name": "@one_week_ago", "value": one_week_ago},  
             ]  
-            items = container.query_items(  
-                query=query,  
-                parameters=parameters,  
-                enable_cross_partition_query=True  
-            )  
+            items = container.query_items(query=query, parameters=parameters, enable_cross_partition_query=True)  
             for item in items:  
                 if 'session_id' in item:  
                     chat = {  
                         "session_id": item['session_id'],  
                         "messages": item.get("messages", []),  
-                        "system_message": item.get("system_message", session.get('default_system_message', "あなたは親切なAIアシスタントです…")),  
+                        "system_message": item.get(  
+                            "system_message", session.get('default_system_message', "あなたは親切なAIアシスタントです…")  
+                        ),  
                         "first_assistant_message": item.get("first_assistant_message", "")  
                     }  
                     sidebar_messages.append(chat)  
@@ -573,7 +426,10 @@ def load_chat_history():
             traceback.print_exc()  
         return sidebar_messages  
   
+  
 def save_system_prompt_item(title: str, content: str):  
+    if not container:  
+        return None  
     with lock:  
         try:  
             user_id = get_authenticated_user()  
@@ -594,21 +450,22 @@ def save_system_prompt_item(title: str, content: str):
             traceback.print_exc()  
             return None  
   
+  
 def load_system_prompts():  
+    if not container:  
+        return []  
     with lock:  
         user_id = get_authenticated_user()  
         prompts = []  
         try:  
-            query = """SELECT c.id, c.title, c.content, c.timestamp  
- FROM c  
- WHERE c.user_id = @user_id AND c.doc_type = 'system_prompt'  
- ORDER BY c.timestamp DESC"""  
+            query = """  
+            SELECT c.id, c.title, c.content, c.timestamp  
+            FROM c  
+            WHERE c.user_id = @user_id AND c.doc_type = 'system_prompt'  
+            ORDER BY c.timestamp DESC  
+            """  
             parameters = [{"name": "@user_id", "value": user_id}]  
-            items = container.query_items(  
-                query=query,  
-                parameters=parameters,  
-                enable_cross_partition_query=True  
-            )  
+            items = container.query_items(query=query, parameters=parameters, enable_cross_partition_query=True)  
             for it in items:  
                 prompts.append({  
                     "id": it.get("id"),  
@@ -621,7 +478,10 @@ def load_system_prompts():
             traceback.print_exc()  
         return prompts  
   
+  
 def delete_system_prompt(prompt_id: str):  
+    if not container:  
+        return False  
     with lock:  
         try:  
             user_id = get_authenticated_user()  
@@ -632,23 +492,26 @@ def delete_system_prompt(prompt_id: str):
             traceback.print_exc()  
             return False  
   
+  
 def start_new_chat():  
     image_filenames = session.get("image_filenames", [])  
     for img_name in image_filenames:  
-        blob_client = image_container_client.get_blob_client(img_name)  
-        try:  
-            blob_client.delete_blob()  
-        except Exception as e:  
-            print("画像削除エラー:", e)  
+        if image_container_client:  
+            blob_client = image_container_client.get_blob_client(img_name)  
+            try:  
+                blob_client.delete_blob()  
+            except Exception as e:  
+                print("画像削除エラー:", e)  
     session["image_filenames"] = []  
   
     file_filenames = session.get("file_filenames", [])  
     for file_name in file_filenames:  
-        blob_client = file_container_client.get_blob_client(file_name)  
-        try:  
-            blob_client.delete_blob()  
-        except Exception as e:  
-            print("ファイル削除エラー:", e)  
+        if file_container_client:  
+            blob_client = file_container_client.get_blob_client(file_name)  
+            try:  
+                blob_client.delete_blob()  
+            except Exception as e:  
+                print("ファイル削除エラー:", e)  
     session["file_filenames"] = []  
   
     new_session_id = str(uuid.uuid4())  
@@ -656,10 +519,7 @@ def start_new_chat():
         "session_id": new_session_id,  
         "messages": [],  
         "first_assistant_message": "",  
-        "system_message": session.get(  
-            'default_system_message',  
-            "あなたは親切なAIアシスタントです…"  
-        )  
+        "system_message": session.get('default_system_message', "あなたは親切なAIアシスタントです…"),  
     }  
     sidebar = session.get("sidebar_messages", [])  
     sidebar.insert(0, new_chat)  
@@ -667,15 +527,17 @@ def start_new_chat():
     session["current_chat_index"] = 0  
     session["main_chat_messages"] = []  
   
-# -------------------------------Azure Cognitive Search-------------------------------  
+  
+# ------------------------------- Azure Cognitive Search -------------------------------  
 def get_search_client(index_name):  
     return SearchClient(  
         endpoint=search_service_endpoint,  
         index_name=index_name,  
         credential=AzureKeyCredential(search_service_key),  
         transport=transport,  
-        api_version="2024-07-01"  
+        api_version="2024-07-01",  
     )  
+  
   
 def keyword_search(query, topNDocuments, index_name):  
     sc = get_search_client(index_name)  
@@ -684,10 +546,11 @@ def keyword_search(query, topNDocuments, index_name):
         search_fields=["title", "content"],  
         select="chunk_id, parent_id, title, content, filepath, url",  
         query_type="simple",  
-        search_mode="all",  # 厳格一致寄り（AND）  
-        top=topNDocuments  
+        search_mode="all",  
+        top=topNDocuments,  
     )  
     return list(results)  
+  
   
 def keyword_semantic_search(query, topNDocuments, index_name, strictness=0.0):  
     sc = get_search_client(index_name)  
@@ -703,7 +566,7 @@ def keyword_semantic_search(query, topNDocuments, index_name, strictness=0.0):
         semantic_configuration_name="default",  
         query_caption="extractive",  
         query_answer="extractive",  
-        top=top  
+        top=top,  
     )  
     filtered = []  
     for r in results:  
@@ -712,6 +575,7 @@ def keyword_semantic_search(query, topNDocuments, index_name, strictness=0.0):
             filtered.append(r)  
     filtered.sort(key=lambda x: x.get("@search.rerankerScore", x.get("@search.score", 0.0)), reverse=True)  
     return filtered  
+  
   
 def get_query_embedding(query):  
     try:  
@@ -722,26 +586,26 @@ def get_query_embedding(query):
         traceback.print_exc()  
         return []  
   
+  
 def keyword_vector_search(query, topNDocuments, index_name):  
     try:  
         sc = get_search_client(index_name)  
         embedding = get_query_embedding(query)  
         if not embedding:  
             return []  
-  
         vector_query = {  
             "kind": "vector",  
             "vector": embedding,  
             "exhaustive": True,  
             "fields": VECTOR_FIELD,  
             "weight": 0.5,  
-            "k": topNDocuments  
+            "k": topNDocuments,  
         }  
         results = sc.search(  
             search_text="*",  
             vector_queries=[vector_query],  
             select="chunk_id, parent_id, title, content, filepath, url",  
-            top=topNDocuments  
+            top=topNDocuments,  
         )  
         results_list = list(results)  
         if results_list and "@search.score" in results_list[0]:  
@@ -752,43 +616,40 @@ def keyword_vector_search(query, topNDocuments, index_name):
         traceback.print_exc()  
         return []  
   
+  
 def hybrid_search_multiqueries(queries, topNDocuments, index_name, strictness=0.0):  
     rrf_k = 60  
     fusion_scores = {}  
     fusion_docs = {}  
-  
     try:  
         req_top = int(topNDocuments)  
     except Exception:  
         req_top = 10  
     fetch_top = int(min(RRF_FETCH_MAX_TOP, max(req_top, req_top * RRF_FETCH_MULTIPLIER)))  
-  
     parent_counts = {}  
-    for q in queries:  
+  
+    for qtext in queries:  
         lists = [  
-            keyword_search(q, fetch_top, index_name),  
-            keyword_semantic_search(q, fetch_top, index_name, strictness),  
-            keyword_vector_search(q, fetch_top, index_name)  
+            keyword_search(qtext, fetch_top, index_name),  
+            keyword_semantic_search(qtext, fetch_top, index_name, strictness),  
+            keyword_vector_search(qtext, fetch_top, index_name),  
         ]  
         for result_list in lists:  
             for idx, r in enumerate(result_list):  
                 dedup_key = r.get("chunk_id") or r.get("filepath") or r.get("id") or r.get("title")  
                 if not dedup_key:  
                     continue  
-  
                 parent_id = r.get("parent_id")  
                 if MAX_CHUNKS_PER_PARENT > 0 and parent_id and dedup_key not in fusion_docs:  
                     if parent_counts.get(parent_id, 0) >= MAX_CHUNKS_PER_PARENT:  
                         continue  
-  
                 contribution = 1 / (rrf_k + (idx + 1))  
                 prev = fusion_scores.get(dedup_key)  
                 fusion_scores[dedup_key] = (prev or 0) + contribution  
-  
                 if dedup_key not in fusion_docs:  
                     fusion_docs[dedup_key] = r  
-                    if MAX_CHUNKS_PER_PARENT > 0 and parent_id:  
-                        parent_counts[parent_id] = parent_counts.get(parent_id, 0) + 1  
+                if MAX_CHUNKS_PER_PARENT > 0 and parent_id:  
+                    parent_counts[parent_id] = parent_counts.get(parent_id, 0) + 1  
   
     sorted_keys = sorted(fusion_scores, key=lambda d: fusion_scores[d], reverse=True)  
     fused_results = []  
@@ -798,16 +659,15 @@ def hybrid_search_multiqueries(queries, topNDocuments, index_name, strictness=0.
         fused_results.append(r)  
     return fused_results  
   
+  
 def rrf_fuse_ranked_lists(lists_of_results, topNDocuments):  
     rrf_k = 60  
     fusion_scores = {}  
     fusion_docs = {}  
-  
     try:  
         req_top = int(topNDocuments)  
     except Exception:  
         req_top = 10  
-  
     for result_list in lists_of_results:  
         for idx, r in enumerate(result_list):  
             dedup_key = r.get("chunk_id") or r.get("filepath") or r.get("id") or r.get("title")  
@@ -818,7 +678,6 @@ def rrf_fuse_ranked_lists(lists_of_results, topNDocuments):
             fusion_scores[dedup_key] = (prev or 0) + contribution  
             if dedup_key not in fusion_docs:  
                 fusion_docs[dedup_key] = r  
-  
     sorted_keys = sorted(fusion_scores, key=lambda d: fusion_scores[d], reverse=True)  
     fused_results = []  
     for k in sorted_keys[:req_top]:  
@@ -827,52 +686,44 @@ def rrf_fuse_ranked_lists(lists_of_results, topNDocuments):
         fused_results.append(r)  
     return fused_results  
   
-# -------------------------------フォールバック: HyDE / PRF（Responses API）-------------------------------  
-def hyde_paragraph(user_input: str) -> str:  
-    sys = "あなたは検索のための仮想文書(HyDE)を作成します。事実の付け足しは避け、中立で。"  
-    p = f"""以下の質問に関して、中立で百科事典調の根拠段落を日本語で5-7文で作成してください。  
-事実断定は避け、関連する用語を豊富に含めてください。これは検索用の仮想文書であり回答ではありません。  
   
-質問: {user_input}  
-"""  
+# ------------------------------- フォールバック: HyDE / PRF（Responses API） -------------------------------  
+def hyde_paragraph(user_input: str) -> str:  
+    sys_msg = "あなたは検索のための仮想文書(HyDE)を作成します。事実の付け足しは避け、中立で。"  
+    p = f"""以下の質問に関して、中立で百科事典調の根拠段落を日本語で5-7文で作成してください。事実断定は避け、関連する用語を豊富に含めてください。これは検索用の仮想文書であり回答ではありません。  
+質問: {user_input}"""  
     input_items = [  
-        {"role": "system", "content": [{"type": "input_text", "text": sys}]},  
-        {"role": "user", "content": [{"type": "input_text", "text": p}]}  
+        {"role": "system", "content": [{"type": "input_text", "text": sys_msg}]},  
+        {"role": "user", "content": [{"type": "input_text", "text": p}]},  
     ]  
     resp = client.responses.create(model=RESPONSES_MODEL, input=input_items, temperature=0.2, max_output_tokens=512)  
     return (extract_output_text(resp) or "").strip()  
   
-def refine_query_with_prf(initial_query: str, titles: list[str]) -> str:  
-    t = "\n".join(f"- {x}" for x in (titles or [])[:8])  
-    prompt = f"""初回検索の上位文書のタイトル一覧です。これを参考に、より適合度の高い検索クエリを日本語で1本だけ生成。  
-不要語は削除し、重要語は維持。出力はクエリ文字列のみ。  
   
+def refine_query_with_prf(initial_query: str, titles: list) -> str:  
+    t = "\n".join(f"- {x}" for x in (titles or [])[:8])  
+    prompt = f"""初回検索の上位文書のタイトル一覧です。これを参考に、より適合度の高い検索クエリを日本語で1本だけ生成。不要語は削除し、重要語は維持。出力はクエリ文字列のみ。  
 タイトル:  
 {t}  
   
-初回クエリ: {initial_query}  
-"""  
+初回クエリ: {initial_query}"""  
     input_items = [  
         {"role": "system", "content": [{"type": "input_text", "text": "あなたは検索クエリの改良を行います。出力は1行のクエリのみ。"}]},  
-        {"role": "user", "content": [{"type": "input_text", "text": prompt}]}  
+        {"role": "user", "content": [{"type": "input_text", "text": prompt}]},  
     ]  
     resp = client.responses.create(model=RESPONSES_MODEL, input=input_items, temperature=0, max_output_tokens=256)  
-    return (extract_output_text(resp) or "").strip().strip("「」' ")  
+    return (extract_output_text(resp) or "").strip().strip('「」\' ')  
+  
   
 def unique_parents(results):  
     return len({(r.get("parent_id") or r.get("filepath") or r.get("title")) for r in (results or [])})  
   
-# -------------------------------Responses API 入力を構築-------------------------------  
+  
+# ------------------------------- Responses API 入力を構築 -------------------------------  
 def build_responses_input_with_history(all_messages, system_message, context_text, max_history_to_send=None):  
     input_items = []  
-  
     if system_message:  
-        input_items.append({  
-            "role": "system",  
-            "content": [  
-                {"type": "input_text", "text": system_message}  
-            ]  
-        })  
+        input_items.append({"role": "system", "content": [{"type": "input_text", "text": system_message}]})  
   
     if max_history_to_send is None:  
         max_history_to_send = MAX_HISTORY_TO_SEND  
@@ -887,36 +738,28 @@ def build_responses_input_with_history(all_messages, system_message, context_tex
         role = m.get("role", "user")  
         if role not in ["user", "assistant"]:  
             continue  
-  
         if role == "assistant":  
             text = m.get("text") or strip_html_tags(m.get("content", ""))  
             content_type = "output_text"  
         else:  
             text = m.get("content", "")  
             content_type = "input_text"  
-  
         if not text:  
             continue  
-  
-        input_items.append({  
-            "role": role,  
-            "content": [  
-                {"type": content_type, "text": text}  
-            ]  
-        })  
+        input_items.append({"role": role, "content": [{"type": content_type, "text": text}]})  
   
     if context_text:  
         for idx in range(len(input_items) - 1, -1, -1):  
             if input_items[idx].get("role") == "user":  
-                input_items[idx]["content"].append({  
-                    "type": "input_text",  
-                    "text": f"以下のコンテキストを参考にしてください:\n{context_text}"  
-                })  
+                input_items[idx]["content"].append(  
+                    {"type": "input_text", "text": f"以下のコンテキストを参考にしてください:\n{context_text}"}  
+                )  
                 break  
   
     return input_items  
   
-# -------------------------------ルーティング-------------------------------  
+  
+# ------------------------------- ルーティング -------------------------------  
 @app.route('/', methods=['GET', 'POST'])  
 def index():  
     get_authenticated_user()  
@@ -941,7 +784,7 @@ def index():
         session["sidebar_messages"] = load_chat_history() or []  
     if "current_chat_index" not in session:  
         start_new_chat()  
-        session["show_all_history"] = False  
+    session["show_all_history"] = session.get("show_all_history", False)  
     if "main_chat_messages" not in session:  
         idx = session.get("current_chat_index", 0)  
         sidebar = session.get("sidebar_messages", [])  
@@ -953,29 +796,23 @@ def index():
         session["image_filenames"] = []  
     if "file_filenames" not in session:  
         session["file_filenames"] = []  
-    if "show_all_history" not in session:  
-        session["show_all_history"] = False  
     if "saved_prompts" not in session:  
         session["saved_prompts"] = load_system_prompts()  
     session.modified = True  
   
     if request.method == 'POST':  
-        # モデル/effort  
         if 'set_model' in request.form:  
             selected = (request.form.get("model") or "").strip()  
             allowed_models = {"gpt-4o", "gpt-4.1", "o3", "o4-mini", "gpt-5"}  
             if selected in allowed_models:  
                 session["selected_model"] = selected  
-  
             effort = (request.form.get("reasoning_effort") or "").strip().lower()  
             allowed_efforts = {"low", "medium", "high"}  
             if session.get("selected_model") in REASONING_ENABLED_MODELS and effort in allowed_efforts:  
                 session["reasoning_effort"] = effort  
-  
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # インデックス  
         if 'set_index' in request.form:  
             sel_index = (request.form.get("search_index") or "").strip()  
             if sel_index in INDEX_VALUES:  
@@ -983,7 +820,6 @@ def index():
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # 取得ドキュメント数  
         if 'set_doc_count' in request.form:  
             raw = (request.form.get("doc_count") or "").strip()  
             try:  
@@ -994,7 +830,6 @@ def index():
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # 直近N発話  
         if 'set_history_to_send' in request.form:  
             raw = (request.form.get("history_to_send") or "").strip()  
             try:  
@@ -1005,7 +840,6 @@ def index():
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # system_message 更新  
         if 'set_system_message' in request.form:  
             sys_msg = (request.form.get("system_message") or "").strip()  
             session["default_system_message"] = sys_msg  
@@ -1017,7 +851,6 @@ def index():
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # 指示テンプレート登録  
         if 'add_system_prompt' in request.form:  
             title = (request.form.get("prompt_title") or "").strip()  
             content = (request.form.get("prompt_content") or "").strip()  
@@ -1030,7 +863,6 @@ def index():
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # 指示テンプレート適用  
         if 'apply_system_prompt' in request.form:  
             pid = request.form.get("select_prompt_id", "")  
             prompts = session.get("saved_prompts", [])  
@@ -1049,7 +881,6 @@ def index():
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # 指示テンプレート削除  
         if 'delete_system_prompt' in request.form:  
             pid = request.form.get("delete_system_prompt", "")  
             if pid:  
@@ -1059,14 +890,12 @@ def index():
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # 新規チャット  
         if 'new_chat' in request.form:  
             start_new_chat()  
             session["show_all_history"] = False  
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # チャット選択  
         if 'select_chat' in request.form:  
             selected_session = request.form.get("select_chat")  
             sidebar = session.get("sidebar_messages", [])  
@@ -1081,13 +910,11 @@ def index():
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # 履歴表示の切替  
         if 'toggle_history' in request.form:  
             session["show_all_history"] = not session.get("show_all_history", False)  
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # ファイルアップロード  
         if 'upload_files' in request.form:  
             if 'files' in request.files:  
                 files = request.files.getlist("files")  
@@ -1098,48 +925,50 @@ def index():
                         filename = secure_filename(f.filename)  
                         ext = filename.rsplit('.', 1)[-1].lower()  
                         if ext in ['png', 'jpeg', 'jpg', 'gif']:  
-                            blob_client = image_container_client.get_blob_client(filename)  
-                            f.stream.seek(0)  
-                            blob_client.upload_blob(f.stream, overwrite=True)  
-                            if filename not in image_filenames:  
-                                image_filenames.append(filename)  
+                            if image_container_client:  
+                                blob_client = image_container_client.get_blob_client(filename)  
+                                f.stream.seek(0)  
+                                blob_client.upload_blob(f.stream, overwrite=True)  
+                                if filename not in image_filenames:  
+                                    image_filenames.append(filename)  
                         elif ext == 'pdf':  
-                            blob_client = file_container_client.get_blob_client(filename)  
-                            f.stream.seek(0)  
-                            blob_client.upload_blob(f.stream, overwrite=True)  
-                            if filename not in file_filenames:  
-                                file_filenames.append(filename)  
+                            if file_container_client:  
+                                blob_client = file_container_client.get_blob_client(filename)  
+                                f.stream.seek(0)  
+                                blob_client.upload_blob(f.stream, overwrite=True)  
+                                if filename not in file_filenames:  
+                                    file_filenames.append(filename)  
                 session["image_filenames"] = image_filenames  
                 session["file_filenames"] = file_filenames  
                 session.modified = True  
             return redirect(url_for('index'))  
   
-        # 画像削除  
         if 'delete_image' in request.form:  
             delete_name = request.form.get("delete_image")  
             image_filenames = session.get("image_filenames", [])  
             image_filenames = [n for n in image_filenames if n != delete_name]  
-            blob_client = image_container_client.get_blob_client(delete_name)  
-            try:  
-                blob_client.delete_blob()  
-            except Exception as e:  
-                print("画像削除エラー:", e)  
-                traceback.print_exc()  
+            if image_container_client:  
+                blob_client = image_container_client.get_blob_client(delete_name)  
+                try:  
+                    blob_client.delete_blob()  
+                except Exception as e:  
+                    print("画像削除エラー:", e)  
+                    traceback.print_exc()  
             session["image_filenames"] = image_filenames  
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # PDF 削除  
         if 'delete_file' in request.form:  
             delete_name = request.form.get("delete_file")  
             file_filenames = session.get("file_filenames", [])  
             file_filenames = [n for n in file_filenames if n != delete_name]  
-            blob_client = file_container_client.get_blob_client(delete_name)  
-            try:  
-                blob_client.delete_blob()  
-            except Exception as e:  
-                print("ファイル削除エラー:", e)  
-                traceback.print_exc()  
+            if file_container_client:  
+                blob_client = file_container_client.get_blob_client(delete_name)  
+                try:  
+                    blob_client.delete_blob()  
+                except Exception as e:  
+                    print("ファイル削除エラー:", e)  
+                    traceback.print_exc()  
             session["file_filenames"] = file_filenames  
             session.modified = True  
             return redirect(url_for('index'))  
@@ -1150,14 +979,8 @@ def index():
     file_filenames = session.get("file_filenames", [])  
     saved_prompts = session.get("saved_prompts", [])  
   
-    images = [  
-        {'name': fn, 'url': image_container_client.get_blob_client(fn).url}  
-        for fn in image_filenames  
-    ]  
-    files = [  
-        {'name': fn, 'url': file_container_client.get_blob_client(fn).url}  
-        for fn in file_filenames  
-    ]  
+    images = [{'name': fn, 'url': image_container_client.get_blob_client(fn).url} for fn in image_filenames] if image_container_client else []  
+    files = [{'name': fn, 'url': file_container_client.get_blob_client(fn).url} for fn in file_filenames] if file_container_client else []  
   
     max_displayed_history = 6  
     max_total_history = 50  
@@ -1177,14 +1000,14 @@ def index():
         saved_prompts=saved_prompts  
     )  
   
-# -------------------------------フロントがまず長文をPOSTする準備エンドポイント-------------------------------  
+  
+# ------------------------------- 長文を事前登録する準備エンドポイント -------------------------------  
 @app.route('/prepare_stream', methods=['POST'])  
 def prepare_stream():  
     data = request.get_json(silent=True) or {}  
     prompt = (data.get('prompt') or '').strip()  
     if not prompt:  
         return jsonify({"error": "missing prompt"}), 400  
-  
     prepared = session.get('prepared_prompts', {})  
     mid = str(uuid.uuid4())  
     prepared[mid] = prompt  
@@ -1192,20 +1015,15 @@ def prepare_stream():
     session.modified = True  
     return jsonify({"message_id": mid})  
   
-# -------------------------------メッセージ送信（JSON・フォールバック用）-------------------------------  
+  
+# ------------------------------- メッセージ送信（非SSE） -------------------------------  
 @app.route('/send_message', methods=['POST'])  
 def send_message():  
     data = request.get_json()  
     prompt = (data.get('prompt') or '').strip()  
-  
     if not prompt:  
         return (  
-            json.dumps({  
-                'response': '',  
-                'search_files': [],  
-                'reasoning_summary': '',  
-                'rewritten_queries': []  
-            }),  
+            json.dumps({'response': '', 'search_files': [], 'reasoning_summary': '', 'rewritten_queries': []}),  
             400,  
             {'Content-Type': 'application/json'}  
         )  
@@ -1220,14 +1038,12 @@ def send_message():
         selected_index = session.get("selected_search_index", DEFAULT_SEARCH_INDEX)  
         doc_count = max(1, min(300, int(session.get("doc_count", DEFAULT_DOC_COUNT))))  
   
-        # system_message（回答専用）  
         system_message = session.get("default_system_message", "")  
         idx = session.get("current_chat_index", 0)  
         sidebar = session.get("sidebar_messages", [])  
         if sidebar and 0 <= idx < len(sidebar):  
             system_message = sidebar[idx].get("system_message", system_message)  
   
-        # リライト（直近N発話を考慮）  
         def _to_text(m):  
             if m.get("role") == "assistant":  
                 return m.get("text") or strip_html_tags(m.get("content", ""))  
@@ -1235,43 +1051,24 @@ def send_message():
   
         turns = max(1, min(MAX_REWRITE_TURNS, len(messages)))  
         recent_texts = [_to_text(m) for m in messages[-turns:]]  
+        rq = rewrite_query(prompt, recent_texts)  
+        queries = [rq or prompt]  
   
-        # おすすめ方式: variants を0本許容 + 合計本数を MAX_REWRITE_QUERIES で厳密制御  
-        rw = rewrite_query_json(prompt, recent_texts, num_variants=max(0, min(5, MAX_REWRITE_QUERIES - 1)))  
-  
-        base_queries = [rw.get("query", "")] if rw.get("query") else [prompt]  
-        mqr = [q for q in (rw.get("variants") or []) if q]  
-        queries = list(dict.fromkeys((base_queries + mqr)[:max(1, MAX_REWRITE_QUERIES)]))  
-  
-        # constraints.must_include を強制付与  
-        constraints = (rw.get("constraints") or {})  
-        must_include = constraints.get("must_include") or []  
-        if must_include:  
-            def _q(w: str) -> str:  
-                w = (w or "").strip()  
-                return f'"{w}"' if " " in w else w  
-            suffix = " ".join(_q(w) for w in must_include if w)  
-            if suffix:  
-                queries = [f"{q} {suffix}".strip() for q in queries]  
-  
-        # 検索  
         strictness = 0.0  
         results_list = hybrid_search_multiqueries(queries, doc_count, selected_index, strictness)  
   
-        # リコール不足 → HyDE  
         threshold = max(MIN_UNIQUE_PARENTS_ABS, int(doc_count * RECALL_PARENT_THRESHOLD_FRACTION))  
         if ENABLE_HYDE and unique_parents(results_list) < threshold:  
             hyde_doc = hyde_paragraph(prompt)  
             hyde_vec_results = keyword_vector_search(hyde_doc, doc_count, selected_index)  
             results_list = rrf_fuse_ranked_lists([results_list, hyde_vec_results], doc_count)  
   
-        # それでも不足 → PRF で再クエリ  
         if ENABLE_PRF and unique_parents(results_list) < threshold and queries:  
             top_titles = [r.get("title", "") for r in results_list[:8]]  
             prf_q = refine_query_with_prf(queries[0], top_titles)  
-            queries2 = list(dict.fromkeys([prf_q] + queries))[:max(1, min(5, MAX_REWRITE_QUERIES))]  
+            queries2 = list(dict.fromkeys([prf_q] + queries))[:2]  
             results_list = hybrid_search_multiqueries(queries2, doc_count, selected_index, strictness)  
-            queries = queries2  # 表示用にも更新  
+            queries = queries2  
   
         context = "\n".join([  
             f"ファイル名: {r.get('title', '不明')}\n内容: {r.get('content','')}"  
@@ -1282,7 +1079,6 @@ def send_message():
         for r in results_list:  
             title = r.get('title', '不明')  
             content = r.get('content', '')  
-  
             fp = (r.get('filepath') or '').replace('\\', '/')  
             container_name, blobname = (None, None)  
             if fp:  
@@ -1291,7 +1087,6 @@ def send_message():
                 u = r.get('url') or ''  
                 if is_azure_blob_url(u):  
                     container_name, blobname = resolve_blob_from_filepath(selected_index, u)  
-  
             url = ''  
             if container_name and blobname:  
                 try:  
@@ -1302,7 +1097,6 @@ def send_message():
                         url = generate_sas_url(blob_client, blobname)  
                 except Exception as e:  
                     print("SAS/ダウンロードURL生成エラー:", e)  
-  
             search_files.append({'title': title, 'content': content, 'url': url})  
   
         history_to_send = session.get("history_to_send", MAX_HISTORY_TO_SEND)  
@@ -1313,7 +1107,6 @@ def send_message():
             max_history_to_send=history_to_send  
         )  
   
-        # 添付（最後の user に付与）  
         last_user_index = None  
         for i in range(len(input_items) - 1, -1, -1):  
             if input_items[i].get("role") == "user":  
@@ -1323,22 +1116,23 @@ def send_message():
         if last_user_index is not None:  
             image_filenames = session.get("image_filenames", [])  
             for img_name in image_filenames:  
+                if not image_container_client:  
+                    continue  
                 blob_client = image_container_client.get_blob_client(img_name)  
                 try:  
                     encoded = encode_image_from_blob(blob_client)  
                     ext = img_name.rsplit('.', 1)[-1].lower()  
                     mime = f"image/{'jpeg' if ext == 'jpg' else ext}" if ext in ['png', 'jpeg', 'jpg', 'gif'] else 'application/octet-stream'  
                     data_url = f"data:{mime};base64,{encoded}"  
-                    input_items[last_user_index]["content"].append(  
-                        {"type": "input_image", "image_url": data_url}  
-                    )  
+                    input_items[last_user_index]["content"].append({"type": "input_image", "image_url": data_url})  
                 except Exception as e:  
                     print("画像エンコードエラー:", e)  
                     traceback.print_exc()  
-  
             file_filenames = session.get("file_filenames", [])  
             for pdf_name in file_filenames:  
                 if pdf_name.lower().endswith('.pdf'):  
+                    if not file_container_client:  
+                        continue  
                     blob_client = file_container_client.get_blob_client(pdf_name)  
                     try:  
                         encoded = encode_pdf_from_blob(blob_client)  
@@ -1365,18 +1159,12 @@ def send_message():
             output_text or "",  
             extras=["tables", "fenced-code-blocks", "code-friendly", "break-on-newline", "cuddled-lists"]  
         )  
-  
         if not output_text:  
             assistant_html = "<p>（応答テキストが空でした。もう一度お試しください）</p>"  
   
         reasoning_summary = extract_reasoning_summary(response)  
   
-        messages.append({  
-            "role": "assistant",  
-            "content": assistant_html,  
-            "type": "html",  
-            "text": output_text  
-        })  
+        messages.append({"role": "assistant", "content": assistant_html, "type": "html", "text": output_text})  
         session["main_chat_messages"] = messages  
         session.modified = True  
   
@@ -1416,26 +1204,17 @@ def send_message():
             {'Content-Type': 'application/json'}  
         )  
   
-# -------------------------------SSE ストリーミング ヘルパー-------------------------------  
+  
+# ------------------------------- SSE ストリーミング ヘルパー -------------------------------  
 def _sse_event(event_name: str, data_obj) -> str:  
     return f"event: {event_name}\ndata: {json.dumps(data_obj, ensure_ascii=False)}\n\n"  
   
-# -------------------------------SSE ストリーミング エンドポイント（二段階方式対応）-------------------------------  
+  
+# ------------------------------- SSE ストリーミング エンドポイント -------------------------------  
 @app.route('/stream_message', methods=['GET'])  
 def stream_message():  
-    """  
-    SSE版のメッセージ送信。  
-    - 先に /prepare_stream で受けた長文をセッションに保持 → ここではID(mid)で取得  
-    - rewritten_queries（JSON CQR + variants）を event: rewritten_queries で先行送信（base_queryは送らない）  
-    - RAG検索結果を event: search_files  
-    - Azure OpenAI Responses API を stream で呼び出し、delta を逐次 event: delta  
-    - 最後に event: reasoning_summary, event: final（HTML）、event: done を送信  
-    - 初回トークンが遅い場合も :keepalive を一定間隔で送出し接続維持  
-    """  
-    # ID優先で取得（後方互換として prompt クエリも許容）  
     mid = (request.args.get('mid') or request.args.get('message_id') or '').strip()  
     prompt = (request.args.get('prompt') or '').strip()  
-  
     if not prompt and mid:  
         prepared = session.get('prepared_prompts', {})  
         prompt = (prepared.get(mid) or '').strip()  
@@ -1443,110 +1222,73 @@ def stream_message():
             del prepared[mid]  
             session['prepared_prompts'] = prepared  
             session.modified = True  
-  
     if not prompt:  
         return ("missing prompt", 400, {"Content-Type": "text/plain; charset=utf-8"})  
   
-    # 直近のセッションにユーザー発話を追加（サーバ側履歴）  
     messages = session.get("main_chat_messages", [])  
     messages.append({"role": "user", "content": prompt, "type": "text"})  
     session["main_chat_messages"] = messages  
     session.modified = True  
     save_chat_history()  
   
-    # セッション依存の値はスレッドに渡すためにローカル変数に取り出す  
     selected_index = session.get("selected_search_index", DEFAULT_SEARCH_INDEX)  
     doc_count = max(1, min(300, int(session.get("doc_count", DEFAULT_DOC_COUNT))))  
     history_to_send = session.get("history_to_send", MAX_HISTORY_TO_SEND)  
   
-    # system_message（回答用）  
     system_message = session.get("default_system_message", "")  
     idx = session.get("current_chat_index", 0)  
     sidebar = session.get("sidebar_messages", [])  
     if sidebar and 0 <= idx < len(sidebar):  
         system_message = sidebar[idx].get("system_message", system_message)  
   
-    # 添付  
     image_filenames = list(session.get("image_filenames", []))  
     file_filenames = list(session.get("file_filenames", []))  
   
-    # モデル・reasoning 設定  
     model_to_use = session.get("selected_model", RESPONSES_MODEL)  
     effort = session.get("reasoning_effort", REASONING_EFFORT)  
     if effort not in {"low", "medium", "high"}:  
         effort = REASONING_EFFORT  
     enable_reasoning = model_to_use in REASONING_ENABLED_MODELS  
   
-    # ストリーム用のキューと共有結果  
-    q: "queue.Queue[str | None]" = queue.Queue(maxsize=100)  
+    q = queue.Queue(maxsize=100)  
     done_event = threading.Event()  
-    result_holder = {  
-        "full_text": "",  
-        "assistant_html": "",  
-        "reasoning_summary": "",  
-        "search_files": [],  
-        "error": None  
-    }  
+    result_holder = {"full_text": "", "assistant_html": "", "reasoning_summary": "", "search_files": [], "error": None}  
   
     @copy_current_request_context  
     def producer():  
         try:  
-            # 1) JSON CQR リライト（直近N発話考慮） → 先に送信  
             def _to_text(m):  
                 if m.get("role") == "assistant":  
                     return m.get("text") or strip_html_tags(m.get("content", ""))  
                 return m.get("content", "")  
+  
             turns = max(1, min(MAX_REWRITE_TURNS, len(messages)))  
             recent_texts = [_to_text(m) for m in messages[-turns:]]  
-            # おすすめ方式: variants を0本許容 + 合計本数を MAX_REWRITE_QUERIES で厳密制御  
-            rw = rewrite_query_json(prompt, recent_texts, num_variants=max(0, min(5, MAX_REWRITE_QUERIES - 1)))  
-            base_queries = [rw.get("query", "")] if rw.get("query") else [prompt]  
-            mqr = [q for q in (rw.get("variants") or []) if q]  
-            queries = list(dict.fromkeys((base_queries + mqr)[:max(1, MAX_REWRITE_QUERIES)]))  
+            rq = rewrite_query(prompt, recent_texts)  
+            queries = [rq or prompt]  
+            q.put(_sse_event("rewritten_queries", {"queries": queries}))  
   
-            # constraints.must_include を強制付与  
-            constraints = (rw.get("constraints") or {})  
-            must_include = constraints.get("must_include") or []  
-            if must_include:  
-                def _q(w: str) -> str:  
-                    w = (w or "").strip()  
-                    return f'"{w}"' if " " in w else w  
-                suffix = " ".join(_q(w) for w in must_include if w)  
-                if suffix:  
-                    queries = [f"{q} {suffix}".strip() for q in queries]  
-  
-            # base_query は送らず、実際に検索に使う queries のみ通知（表示重複を避ける）  
-            q.put(_sse_event("rewritten_queries", {  
-                "queries": queries,  
-                "needs_clarification": bool(rw.get("needs_clarification", False))  
-            }))  
-  
-            # 2) RAG検索  
             strictness = 0.0  
             results_list = hybrid_search_multiqueries(queries, doc_count, selected_index, strictness)  
   
-            # 3) リコール不足なら HyDE  
             threshold = max(MIN_UNIQUE_PARENTS_ABS, int(doc_count * RECALL_PARENT_THRESHOLD_FRACTION))  
             if ENABLE_HYDE and unique_parents(results_list) < threshold:  
                 hyde_doc = hyde_paragraph(prompt)  
                 hyde_vec_results = keyword_vector_search(hyde_doc, doc_count, selected_index)  
                 results_list = rrf_fuse_ranked_lists([results_list, hyde_vec_results], doc_count)  
   
-            # 4) それでも不足なら PRF  
             if ENABLE_PRF and unique_parents(results_list) < threshold and queries:  
                 top_titles = [r.get("title", "") for r in results_list[:8]]  
                 prf_q = refine_query_with_prf(queries[0], top_titles)  
-                queries2 = list(dict.fromkeys([prf_q] + queries))[:max(1, min(5, MAX_REWRITE_QUERIES))]  
+                queries2 = list(dict.fromkeys([prf_q] + queries))[:2]  
                 results_list = hybrid_search_multiqueries(queries2, doc_count, selected_index, strictness)  
-                queries = queries2  # 内部整合のため更新  
+                queries = queries2  
   
-            # 5) コンテキスト  
             context = "\n".join([  
                 f"ファイル名: {r.get('title', '不明')}\n内容: {r.get('content','')}"  
                 for r in results_list  
             ])[:50000]  
   
-            # 6) UI向け文書リンク  
             search_files = []  
             for r in results_list:  
                 title = r.get('title', '不明')  
@@ -1559,7 +1301,6 @@ def stream_message():
                     u = r.get('url') or ''  
                     if is_azure_blob_url(u):  
                         container_name, blobname = resolve_blob_from_filepath(selected_index, u)  
-  
                 url = ''  
                 if container_name and blobname:  
                     try:  
@@ -1570,13 +1311,11 @@ def stream_message():
                             url = generate_sas_url(blob_client, blobname)  
                     except Exception as e:  
                         print("SAS/ダウンロードURL生成エラー:", e)  
-  
                 search_files.append({'title': title, 'content': content, 'url': url})  
   
             result_holder["search_files"] = search_files  
             q.put(_sse_event("search_files", search_files))  
   
-            # 7) Responses API 入力  
             input_items = build_responses_input_with_history(  
                 all_messages=messages,  
                 system_message=system_message,  
@@ -1584,7 +1323,6 @@ def stream_message():
                 max_history_to_send=history_to_send  
             )  
   
-            # 8) 添付付与  
             last_user_index = None  
             for i in range(len(input_items) - 1, -1, -1):  
                 if input_items[i].get("role") == "user":  
@@ -1593,6 +1331,8 @@ def stream_message():
   
             if last_user_index is not None:  
                 for img_name in image_filenames:  
+                    if not image_container_client:  
+                        continue  
                     blob_client = image_container_client.get_blob_client(img_name)  
                     try:  
                         encoded = encode_image_from_blob(blob_client)  
@@ -1603,9 +1343,10 @@ def stream_message():
                     except Exception as e:  
                         print("画像エンコードエラー:", e)  
                         traceback.print_exc()  
-  
                 for pdf_name in file_filenames:  
                     if pdf_name.lower().endswith('.pdf'):  
+                        if not file_container_client:  
+                            continue  
                         blob_client = file_container_client.get_blob_client(pdf_name)  
                         try:  
                             encoded = encode_pdf_from_blob(blob_client)  
@@ -1618,7 +1359,6 @@ def stream_message():
                             print("PDFエンコードエラー:", e)  
                             traceback.print_exc()  
   
-            # 9) モデル呼び出し（stream=True）  
             request_kwargs = dict(model=model_to_use, input=input_items)  
             if enable_reasoning:  
                 request_kwargs["reasoning"] = {"effort": effort}  
@@ -1636,11 +1376,10 @@ def stream_message():
                         msg = str(err) if err else "unknown error"  
                         result_holder["error"] = msg  
                         q.put(_sse_event("error", {"message": msg}))  
-  
                 final_response = stream.get_final_response()  
+  
             result_holder["reasoning_summary"] = extract_reasoning_summary(final_response)  
   
-            # 10) HTML化  
             full_text = result_holder["full_text"]  
             if full_text:  
                 assistant_html = markdown2.markdown(  
@@ -1649,7 +1388,6 @@ def stream_message():
                 )  
             else:  
                 assistant_html = "<p>（応答テキストが空でした。もう一度お試しください）</p>"  
-  
             result_holder["assistant_html"] = assistant_html  
   
             if result_holder["reasoning_summary"]:  
@@ -1678,13 +1416,11 @@ def stream_message():
   
     def generate():  
         yield ":connected\n\n"  
-  
         while True:  
             chunk = q.get()  
             if chunk is None:  
                 break  
             yield chunk  
-  
         try:  
             if result_holder["assistant_html"] or result_holder["full_text"]:  
                 msgs = session.get("main_chat_messages", [])  
@@ -1696,17 +1432,14 @@ def stream_message():
                 })  
                 session["main_chat_messages"] = msgs  
                 session.modified = True  
-  
                 idx2 = session.get("current_chat_index", 0)  
                 sidebar2 = session.get("sidebar_messages", [])  
                 if idx2 < len(sidebar2):  
                     sidebar2[idx2]["messages"] = msgs  
                     if not sidebar2[idx2].get("first_assistant_message"):  
-                        sidebar2[idx2].get("first_assistant_message")  
                         sidebar2[idx2]["first_assistant_message"] = result_holder["full_text"]  
                     session["sidebar_messages"] = sidebar2  
                     session.modified = True  
-  
                 save_chat_history()  
         except Exception as e:  
             print("SSE後処理の履歴保存エラー:", e)  
@@ -1720,9 +1453,12 @@ def stream_message():
     }  
     return app.response_class(stream_with_context(generate()), headers=headers)  
   
-# -------------------------------テキスト Blob ダウンロード-------------------------------  
+  
+# ------------------------------- テキスト Blob ダウンロード -------------------------------  
 @app.route("/download_txt/<container>/<path:blobname>")  
 def download_txt(container, blobname):  
+    if not blob_service_client:  
+        return ("Blob service not configured", 500)  
     blobname = unquote(blobname)  
     blob_client = blob_service_client.get_blob_client(container=container, blob=blobname)  
     txt_bytes = blob_client.download_blob().readall()  
@@ -1745,7 +1481,7 @@ def download_txt(container, blobname):
     )  
     return response  
   
-# -------------------------------エントリポイント-------------------------------  
+  
+# ------------------------------- エントリポイント -------------------------------  
 if __name__ == '__main__':  
-    # ローカル実行用。Azure App Service（Linux）では Gunicorn を推奨（例: gunicorn -w 1 -k gevent app:app）  
     app.run(debug=True, host='0.0.0.0')  
