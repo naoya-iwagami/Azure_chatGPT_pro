@@ -1,26 +1,12 @@
 #!/usr/bin/env python3  
 # -*- coding: utf-8 -*-  
-  
 """  
 PM Compass – Flask アプリ（PDFアップロード＆分析対応版, 埋め込み分離 + RRFオーバーフェッチ対応 + SSEストリーミング対応, シンプルクエリリライト版）  
-  
-主な機能:  
-- Azure OpenAI Responses API を使用（system 役割、会話履歴、reasoning 対応, ストリーミング対応）  
-- Azure Cognitive Search のハイブリッド検索（キーワード＋セマンティック＋ベクター, RRF融合）  
-- 取得ドキュメント数を 1～300 の範囲で変更可能（デフォルト10）  
-- 会話履歴の送信件数を 1～50 の範囲で変更可能（デフォルト10）  
-- モデル選択（gpt-4o / gpt-4.1 / o3 / o4-mini / gpt-5）と reasoning_effort 設定  
-- 画像/PDF アップロード（画像: input_image, PDF: input_file）に対応  
-- Cosmos DB にチャット履歴・指示テンプレートを保存/読込/削除  
-- 検索結果（search_files）をフロントで番号付き表示し、SASリンクやテキストダウンロードも提供  
-- SSE によるストリーミング出力（/stream_message）  
-- クエリリライトをシンプル化（会話履歴 + 最新発話から日本語の検索用クエリを1本のみ生成、Responses API使用）  
-  
-本版のポイント:  
-- クエリリライトは「1本のみのシンプルな検索クエリ」を Responses API で生成  
-- リライト用のシステムメッセージは使用しない  
-- リライト用モデルは gpt-4o を固定で使用  
-- 旧来の rewrite_query_json と関連ヘルパー・環境変数は廃止  
+- 画像/PDFアップロード対応（input_image / input_file）  
+- セッション終了時の自動削除（sendBeacon + /cleanup_session_files）  
+- Azure Cognitive Search ハイブリッド検索（RRF融合）  
+- Azure OpenAI Responses API（ストリーミング対応）  
+- PDF は file_data(Base64) + filename 方式で添付（file_url は使用しない）  
 """  
   
 import os  
@@ -55,14 +41,12 @@ from werkzeug.utils import secure_filename
 import certifi  
 from azure.core.credentials import AzureKeyCredential  
 from azure.core.pipeline.transport import RequestsTransport  
+from azure.core.pipeline.policies import RetryPolicy  
 from azure.search.documents import SearchClient  
 from azure.cosmos import CosmosClient  
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions  
 from openai import AzureOpenAI  
 import markdown2  
-
-os.environ['HTTP_PROXY'] = 'http://g3.konicaminolta.jp:8080'
-os.environ['HTTPS_PROXY'] = 'http://g3.konicaminolta.jp:8080'
   
 # ------------------------------- Azure OpenAI クライアント設定 -------------------------------  
 client = AzureOpenAI(  
@@ -86,6 +70,8 @@ REASONING_ENABLED_MODELS = set(
 )  
 REASONING_EFFORT = os.getenv("REASONING_EFFORT", "high")  
   
+# 添付ガード（VISION_FILE_MODELS）は撤廃  
+  
 EMBEDDING_MODEL = os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT", "text-embedding-3-large")  
 VECTOR_FIELD = "contentVector"  
   
@@ -97,13 +83,16 @@ RRF_FETCH_MAX_TOP = int(os.getenv("RRF_FETCH_MAX_TOP", "300"))
   
 MAX_CHUNKS_PER_PARENT = int(os.getenv("MAX_CHUNKS_PER_PARENT", "0"))  
   
-REWRITE_MODEL = "gpt-4.1"  # 固定  
+REWRITE_MODEL = "gpt-4o"  # 固定  
 MAX_REWRITE_TURNS = max(1, min(8, int(os.getenv("MAX_REWRITE_TURNS", "4"))))  
   
 ENABLE_HYDE = os.getenv("ENABLE_HYDE", "1") not in ("0", "false", "False")  
 ENABLE_PRF = os.getenv("ENABLE_PRF", "1") not in ("0", "false", "False")  
 RECALL_PARENT_THRESHOLD_FRACTION = float(os.getenv("RECALL_PARENT_THRESHOLD_FRACTION", "0.4"))  
 MIN_UNIQUE_PARENTS_ABS = int(os.getenv("MIN_UNIQUE_PARENTS_ABS", "3"))  
+  
+# 添付の最大バイト（超過時は添付スキップ）  
+MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(5 * 1024 * 1024)))  # 5MB  
   
 # ------------------------------- Flask アプリ設定 -------------------------------  
 app = Flask(__name__)  
@@ -114,10 +103,37 @@ app.config['SESSION_PERMANENT'] = False
 os.makedirs(app.config['SESSION_FILE_DIR'], exist_ok=True)  
 Session(app)  
   
+# ------------------------------- 共通 RequestsTransport/Retry 設定 -------------------------------  
+def _build_requests_transport():  
+    proxies = {}  
+    http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")  
+    https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")  
+    if http_proxy:  
+        proxies["http"] = http_proxy  
+    if https_proxy:  
+        proxies["https"] = https_proxy  
+    verify_path = os.getenv("REQUESTS_CA_BUNDLE") or os.getenv("AZURE_CA_BUNDLE") or certifi.where()  
+    conn_timeout = int(os.getenv("AZURE_HTTP_CONN_TIMEOUT", "20"))  
+    read_timeout = int(os.getenv("AZURE_HTTP_READ_TIMEOUT", "120"))  
+    return RequestsTransport(  
+        connection_verify=verify_path,  # verify ではなく connection_verify  
+        proxies=proxies or None,  
+        connection_timeout=conn_timeout,  
+        read_timeout=read_timeout,  
+    )  
+  
+transport = _build_requests_transport()  
+retry_policy = RetryPolicy(  
+    retry_total=int(os.getenv("AZURE_RETRY_TOTAL", "5")),  
+    retry_connect=3,  
+    retry_read=3,  
+    retry_status=3,  
+    retry_backoff_factor=float(os.getenv("AZURE_RETRY_BACKOFF", "0.8")),  
+)  
+  
 # ------------------------------- Azure サービスクライアント -------------------------------  
 search_service_endpoint = os.getenv("AZURE_SEARCH_ENDPOINT")  
 search_service_key = os.getenv("AZURE_SEARCH_KEY")  
-transport = RequestsTransport(verify=certifi.where())  
   
 cosmos_endpoint = os.getenv("AZURE_COSMOS_ENDPOINT")  
 cosmos_key = os.getenv("AZURE_COSMOS_KEY")  
@@ -132,11 +148,28 @@ else:
     container = None  
   
 blob_connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")  
-blob_service_client = BlobServiceClient.from_connection_string(blob_connection_string) if blob_connection_string else None  
+blob_service_client = BlobServiceClient.from_connection_string(  
+    blob_connection_string,  
+    transport=transport  
+) if blob_connection_string else None  
+  
 image_container_name = 'chatgpt-image'  
-image_container_client = blob_service_client.get_container_client(image_container_name) if blob_service_client else None  
 file_container_name = 'chatgpt-files'  
-file_container_client = blob_service_client.get_container_client(file_container_name) if blob_service_client else None  
+  
+# コンテナ自動作成（既存ならスキップ）  
+image_container_client = None  
+file_container_client = None  
+if blob_service_client:  
+    try:  
+        blob_service_client.create_container(image_container_name)  
+    except Exception:  
+        pass  
+    try:  
+        blob_service_client.create_container(file_container_name)  
+    except Exception:  
+        pass  
+    image_container_client = blob_service_client.get_container_client(image_container_name)  
+    file_container_client = blob_service_client.get_container_client(file_container_name)  
   
 INDEX_OPTIONS = [  
     ("通常データ", "filetest11-large"),  
@@ -174,18 +207,17 @@ INDEX_LANG = {
     "quality-assurance": "ja",  
 }  
   
-  
 def to_query_language(lang: str) -> str:  
     return "ja-JP" if (lang or "").lower().startswith("ja") else "en-US"  
-  
   
 lock = threading.Lock()  
   
 # ------------------------------- ユーティリティ -------------------------------  
 def extract_account_key(connection_string: str) -> str:  
+    if not connection_string:  
+        return ""  
     pairs = [s.split("=", 1) for s in connection_string.split(";") if "=" in s]  
     return dict(pairs).get("AccountKey")  
-  
   
 def generate_sas_url(blob_client, blob_name):  
     connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")  
@@ -203,18 +235,24 @@ def generate_sas_url(blob_client, blob_name):
     )  
     return f"{blob_client.url}?{sas_token}"  
   
+def make_blob_url(container_name: str, blobname: str) -> str:  
+    if not blob_service_client:  
+        return ""  
+    bc = blob_service_client.get_blob_client(container=container_name, blob=blobname)  
+    try:  
+        return generate_sas_url(bc, blobname)  
+    except Exception:  
+        return bc.url  
   
 def encode_image_from_blob(blob_client):  
     downloader = blob_client.download_blob()  
     image_bytes = downloader.readall()  
     return base64.b64encode(image_bytes).decode('utf-8')  
   
-  
 def encode_pdf_from_blob(blob_client):  
     downloader = blob_client.download_blob()  
     pdf_bytes = downloader.readall()  
     return base64.b64encode(pdf_bytes).decode('utf-8')  
-  
   
 def strip_html_tags(html: str) -> str:  
     if not html:  
@@ -223,7 +261,6 @@ def strip_html_tags(html: str) -> str:
     html = re.sub(r'</p\s*>', '\n', html, flags=re.I)  
     text = re.sub(r'<[^>]+>', '', html)  
     return text  
-  
   
 def extract_reasoning_summary(resp) -> str:  
     try:  
@@ -252,7 +289,6 @@ def extract_reasoning_summary(resp) -> str:
         print("Reasoning summary 取得エラー:", e)  
     return ""  
   
-  
 def extract_output_text(resp) -> str:  
     try:  
         if hasattr(resp, "output_text") and resp.output_text:  
@@ -280,7 +316,6 @@ def extract_output_text(resp) -> str:
         traceback.print_exc()  
         return ""  
   
-  
 def is_azure_blob_url(u: str) -> bool:  
     if not u:  
         return False  
@@ -292,7 +327,6 @@ def is_azure_blob_url(u: str) -> bool:
         return (".blob.core.windows.net" in host) or host.startswith("127.0.0.1") or host.startswith("localhost")  
     except Exception:  
         return False  
-  
   
 def resolve_blob_from_filepath(selected_index: str, path_or_url: str):  
     if not path_or_url:  
@@ -314,11 +348,10 @@ def resolve_blob_from_filepath(selected_index: str, path_or_url: str):
         blobname = blobname[len(container) + 1:]  
     return container, blobname  
   
-  
-# ------------------------------- クエリリライト（シンプル版：1本のみ、Responses API） -------------------------------  
+# ------------------------------- クエリリライト -------------------------------  
 def rewrite_query(user_input: str, recent_messages: list) -> str:  
     prompt = (  
-        "あなたは有能な検索アシスタントです。\n"  
+        "あなたは社内情報検索のためのアシスタントです。\n"  
         "以下の会話履歴とユーザーの最新質問をもとに、検索エンジンに適した簡潔で明確な日本語クエリを1つだけ生成してください。\n"  
         "不要な会話表現や雑談は除外し、検索意図を正確に反映したキーワードやフレーズを含めてください。\n"  
         "【会話履歴】\n"  
@@ -333,7 +366,6 @@ def rewrite_query(user_input: str, recent_messages: list) -> str:
     rewritten = (extract_output_text(resp) or "").strip()  
     rewritten = rewritten.splitlines()[0].strip().strip('「」"\' 　')  
     return rewritten  
-  
   
 # ------------------------------- 認証/履歴/指示テンプレート -------------------------------  
 def get_authenticated_user():  
@@ -360,7 +392,6 @@ def get_authenticated_user():
     session["user_id"] = "anonymous@example.com"  
     session["user_name"] = "anonymous"  
     return session["user_id"]  
-  
   
 def save_chat_history():  
     if not container:  
@@ -390,7 +421,6 @@ def save_chat_history():
         except Exception as e:  
             print("チャット履歴保存エラー:", e)  
             traceback.print_exc()  
-  
   
 def load_chat_history():  
     if not container:  
@@ -426,7 +456,6 @@ def load_chat_history():
             traceback.print_exc()  
         return sidebar_messages  
   
-  
 def save_system_prompt_item(title: str, content: str):  
     if not container:  
         return None  
@@ -449,7 +478,6 @@ def save_system_prompt_item(title: str, content: str):
             print("システムプロンプト保存エラー:", e)  
             traceback.print_exc()  
             return None  
-  
   
 def load_system_prompts():  
     if not container:  
@@ -478,7 +506,6 @@ def load_system_prompts():
             traceback.print_exc()  
         return prompts  
   
-  
 def delete_system_prompt(prompt_id: str):  
     if not container:  
         return False  
@@ -492,24 +519,23 @@ def delete_system_prompt(prompt_id: str):
             traceback.print_exc()  
             return False  
   
-  
 def start_new_chat():  
+    # 画像削除  
     image_filenames = session.get("image_filenames", [])  
     for img_name in image_filenames:  
         if image_container_client:  
-            blob_client = image_container_client.get_blob_client(img_name)  
             try:  
-                blob_client.delete_blob()  
+                image_container_client.get_blob_client(img_name).delete_blob()  
             except Exception as e:  
                 print("画像削除エラー:", e)  
     session["image_filenames"] = []  
   
+    # PDF削除  
     file_filenames = session.get("file_filenames", [])  
     for file_name in file_filenames:  
         if file_container_client:  
-            blob_client = file_container_client.get_blob_client(file_name)  
             try:  
-                blob_client.delete_blob()  
+                file_container_client.get_blob_client(file_name).delete_blob()  
             except Exception as e:  
                 print("ファイル削除エラー:", e)  
     session["file_filenames"] = []  
@@ -527,7 +553,6 @@ def start_new_chat():
     session["current_chat_index"] = 0  
     session["main_chat_messages"] = []  
   
-  
 # ------------------------------- Azure Cognitive Search -------------------------------  
 def get_search_client(index_name):  
     return SearchClient(  
@@ -535,9 +560,9 @@ def get_search_client(index_name):
         index_name=index_name,  
         credential=AzureKeyCredential(search_service_key),  
         transport=transport,  
+        retry_policy=retry_policy,  
         api_version="2024-07-01",  
     )  
-  
   
 def keyword_search(query, topNDocuments, index_name):  
     sc = get_search_client(index_name)  
@@ -550,7 +575,6 @@ def keyword_search(query, topNDocuments, index_name):
         top=topNDocuments,  
     )  
     return list(results)  
-  
   
 def keyword_semantic_search(query, topNDocuments, index_name, strictness=0.0):  
     sc = get_search_client(index_name)  
@@ -576,7 +600,6 @@ def keyword_semantic_search(query, topNDocuments, index_name, strictness=0.0):
     filtered.sort(key=lambda x: x.get("@search.rerankerScore", x.get("@search.score", 0.0)), reverse=True)  
     return filtered  
   
-  
 def get_query_embedding(query):  
     try:  
         resp = embed_client.embeddings.create(model=EMBEDDING_MODEL, input=query, dimensions=1536)  
@@ -585,7 +608,6 @@ def get_query_embedding(query):
         print("Embedding 生成エラー:", e)  
         traceback.print_exc()  
         return []  
-  
   
 def keyword_vector_search(query, topNDocuments, index_name):  
     try:  
@@ -615,7 +637,6 @@ def keyword_vector_search(query, topNDocuments, index_name):
         print("ベクター検索エラー:", e)  
         traceback.print_exc()  
         return []  
-  
   
 def hybrid_search_multiqueries(queries, topNDocuments, index_name, strictness=0.0):  
     rrf_k = 60  
@@ -659,7 +680,6 @@ def hybrid_search_multiqueries(queries, topNDocuments, index_name, strictness=0.
         fused_results.append(r)  
     return fused_results  
   
-  
 def rrf_fuse_ranked_lists(lists_of_results, topNDocuments):  
     rrf_k = 60  
     fusion_scores = {}  
@@ -686,7 +706,6 @@ def rrf_fuse_ranked_lists(lists_of_results, topNDocuments):
         fused_results.append(r)  
     return fused_results  
   
-  
 # ------------------------------- フォールバック: HyDE / PRF（Responses API） -------------------------------  
 def hyde_paragraph(user_input: str) -> str:  
     sys_msg = "あなたは検索のための仮想文書(HyDE)を作成します。事実の付け足しは避け、中立で。"  
@@ -698,7 +717,6 @@ def hyde_paragraph(user_input: str) -> str:
     ]  
     resp = client.responses.create(model=RESPONSES_MODEL, input=input_items, temperature=0.2, max_output_tokens=512)  
     return (extract_output_text(resp) or "").strip()  
-  
   
 def refine_query_with_prf(initial_query: str, titles: list) -> str:  
     t = "\n".join(f"- {x}" for x in (titles or [])[:8])  
@@ -714,10 +732,8 @@ def refine_query_with_prf(initial_query: str, titles: list) -> str:
     resp = client.responses.create(model=RESPONSES_MODEL, input=input_items, temperature=0, max_output_tokens=256)  
     return (extract_output_text(resp) or "").strip().strip('「」\' ')  
   
-  
 def unique_parents(results):  
     return len({(r.get("parent_id") or r.get("filepath") or r.get("title")) for r in (results or [])})  
-  
   
 # ------------------------------- Responses API 入力を構築 -------------------------------  
 def build_responses_input_with_history(all_messages, system_message, context_text, max_history_to_send=None):  
@@ -758,12 +774,50 @@ def build_responses_input_with_history(all_messages, system_message, context_tex
   
     return input_items  
   
+# ------------------------------- セッション内アップロードの一括削除 + エンドポイント -------------------------------  
+def _delete_uploaded_files_for_session():  
+    deleted = {"images": [], "files": []}  
+    try:  
+        # 画像  
+        image_filenames = list(session.get("image_filenames", []))  
+        if image_container_client:  
+            for name in image_filenames:  
+                try:  
+                    bc = image_container_client.get_blob_client(name)  
+                    if bc.exists():  
+                        bc.delete_blob(delete_snapshots="include")  
+                        deleted["images"].append(name)  
+                except Exception as e:  
+                    print("画像削除失敗:", name, e)  
+        # PDF  
+        file_filenames = list(session.get("file_filenames", []))  
+        if file_container_client:  
+            for name in file_filenames:  
+                try:  
+                    bc = file_container_client.get_blob_client(name)  
+                    if bc.exists():  
+                        bc.delete_blob(delete_snapshots="include")  
+                        deleted["files"].append(name)  
+                except Exception as e:  
+                    print("PDF削除失敗:", name, e)  
+        session["image_filenames"] = []  
+        session["file_filenames"] = []  
+        session.modified = True  
+    except Exception as e:  
+        print("セッションファイル一括削除エラー:", e)  
+    return deleted  
+  
+@app.route('/cleanup_session_files', methods=['POST'])  
+def cleanup_session_files():  
+    result = _delete_uploaded_files_for_session()  
+    return jsonify({"ok": True, "deleted": result})  
   
 # ------------------------------- ルーティング -------------------------------  
 @app.route('/', methods=['GET', 'POST'])  
 def index():  
     get_authenticated_user()  
   
+    # 初期設定  
     if "selected_model" not in session:  
         session["selected_model"] = RESPONSES_MODEL  
     if "reasoning_effort" not in session:  
@@ -784,22 +838,23 @@ def index():
         session["sidebar_messages"] = load_chat_history() or []  
     if "current_chat_index" not in session:  
         start_new_chat()  
-    session["show_all_history"] = session.get("show_all_history", False)  
     if "main_chat_messages" not in session:  
-        idx = session.get("current_chat_index", 0)  
-        sidebar = session.get("sidebar_messages", [])  
-        if sidebar and idx < len(sidebar):  
-            session["main_chat_messages"] = sidebar[idx].get("messages", [])  
-        else:  
-            session["main_chat_messages"] = []  
+        idx0 = session.get("current_chat_index", 0)  
+        sb = session.get("sidebar_messages", [])  
+        session["main_chat_messages"] = sb[idx0].get("messages", []) if (sb and idx0 < len(sb)) else []  
     if "image_filenames" not in session:  
         session["image_filenames"] = []  
     if "file_filenames" not in session:  
         session["file_filenames"] = []  
     if "saved_prompts" not in session:  
         session["saved_prompts"] = load_system_prompts()  
+    if "show_all_history" not in session:  
+        session["show_all_history"] = False  
+    if "upload_prefix" not in session:  
+        session["upload_prefix"] = str(uuid.uuid4())  # セッション専用プレフィックス  
     session.modified = True  
   
+    # POST ハンドラ  
     if request.method == 'POST':  
         if 'set_model' in request.form:  
             selected = (request.form.get("model") or "").strip()  
@@ -903,9 +958,7 @@ def index():
                 if chat.get("session_id") == selected_session:  
                     session["current_chat_index"] = idx  
                     session["main_chat_messages"] = chat.get("messages", [])  
-                    session["default_system_message"] = chat.get(  
-                        "system_message", session.get("default_system_message")  
-                    )  
+                    session["default_system_message"] = chat.get("system_message", session.get("default_system_message"))  
                     break  
             session.modified = True  
             return redirect(url_for('index'))  
@@ -920,68 +973,88 @@ def index():
                 files = request.files.getlist("files")  
                 image_filenames = session.get("image_filenames", [])  
                 file_filenames = session.get("file_filenames", [])  
+                upload_prefix = session.get("upload_prefix") or str(uuid.uuid4())  
+                session["upload_prefix"] = upload_prefix  
                 for f in files:  
                     if f and f.filename != '':  
-                        filename = secure_filename(f.filename)  
-                        ext = filename.rsplit('.', 1)[-1].lower()  
+                        original = secure_filename(f.filename)  
+                        ext = original.rsplit('.', 1)[-1].lower() if '.' in original else ''  
+                        blob_name = f"{upload_prefix}/{uuid.uuid4()}__{original}"  
                         if ext in ['png', 'jpeg', 'jpg', 'gif']:  
                             if image_container_client:  
-                                blob_client = image_container_client.get_blob_client(filename)  
-                                f.stream.seek(0)  
-                                blob_client.upload_blob(f.stream, overwrite=True)  
-                                if filename not in image_filenames:  
-                                    image_filenames.append(filename)  
+                                blob_client = image_container_client.get_blob_client(blob_name)  
+                                try:  
+                                    f.stream.seek(0)  
+                                    blob_client.upload_blob(f.stream, overwrite=True)  
+                                    if blob_name not in image_filenames:  
+                                        image_filenames.append(blob_name)  
+                                except Exception as e:  
+                                    print("画像アップロードエラー:", e)  
+                                    flash("画像アップロードに失敗しました。", "error")  
                         elif ext == 'pdf':  
                             if file_container_client:  
-                                blob_client = file_container_client.get_blob_client(filename)  
-                                f.stream.seek(0)  
-                                blob_client.upload_blob(f.stream, overwrite=True)  
-                                if filename not in file_filenames:  
-                                    file_filenames.append(filename)  
+                                blob_client = file_container_client.get_blob_client(blob_name)  
+                                try:  
+                                    f.stream.seek(0)  
+                                    blob_client.upload_blob(f.stream, overwrite=True)  
+                                    if blob_name not in file_filenames:  
+                                        file_filenames.append(blob_name)  
+                                except Exception as e:  
+                                    print("PDFアップロードエラー:", e)  
+                                    flash("PDFアップロードに失敗しました。", "error")  
                 session["image_filenames"] = image_filenames  
                 session["file_filenames"] = file_filenames  
                 session.modified = True  
             return redirect(url_for('index'))  
   
         if 'delete_image' in request.form:  
-            delete_name = request.form.get("delete_image")  
-            image_filenames = session.get("image_filenames", [])  
-            image_filenames = [n for n in image_filenames if n != delete_name]  
-            if image_container_client:  
-                blob_client = image_container_client.get_blob_client(delete_name)  
+            delete_blobname = request.form.get("delete_image")  
+            image_filenames = [n for n in session.get("image_filenames", []) if n != delete_blobname]  
+            if image_container_client and delete_blobname:  
                 try:  
-                    blob_client.delete_blob()  
+                    bc = image_container_client.get_blob_client(delete_blobname)  
+                    if bc.exists():  
+                        bc.delete_blob(delete_snapshots="include")  
                 except Exception as e:  
-                    print("画像削除エラー:", e)  
-                    traceback.print_exc()  
+                    print("画像削除エラー(無視可):", e)  
             session["image_filenames"] = image_filenames  
             session.modified = True  
             return redirect(url_for('index'))  
   
         if 'delete_file' in request.form:  
-            delete_name = request.form.get("delete_file")  
-            file_filenames = session.get("file_filenames", [])  
-            file_filenames = [n for n in file_filenames if n != delete_name]  
-            if file_container_client:  
-                blob_client = file_container_client.get_blob_client(delete_name)  
+            delete_blobname = request.form.get("delete_file")  
+            file_filenames = [n for n in session.get("file_filenames", []) if n != delete_blobname]  
+            if file_container_client and delete_blobname:  
                 try:  
-                    blob_client.delete_blob()  
+                    bc = file_container_client.get_blob_client(delete_blobname)  
+                    if bc.exists():  
+                        bc.delete_blob(delete_snapshots="include")  
                 except Exception as e:  
-                    print("ファイル削除エラー:", e)  
-                    traceback.print_exc()  
+                    print("ファイル削除エラー(無視可):", e)  
             session["file_filenames"] = file_filenames  
             session.modified = True  
             return redirect(url_for('index'))  
   
+    # 描画データ作成（SAS URLを発行）  
+    images = []  
+    if image_container_client:  
+        for blobname in session.get("image_filenames", []):  
+            base = blobname.split("/")[-1]  
+            display = base.split("__", 1)[1] if "__" in base else base  
+            url = make_blob_url(image_container_name, blobname)  
+            images.append({'name': display, 'blob': blobname, 'url': url})  
+  
+    files = []  
+    if file_container_client:  
+        for blobname in session.get("file_filenames", []):  
+            base = blobname.split("/")[-1]  
+            display = base.split("__", 1)[1] if "__" in base else base  
+            url = make_blob_url(file_container_name, blobname)  
+            files.append({'name': display, 'blob': blobname, 'url': url})  
+  
     chat_history = session.get("main_chat_messages", [])  
     sidebar_messages = session.get("sidebar_messages", [])  
-    image_filenames = session.get("image_filenames", [])  
-    file_filenames = session.get("file_filenames", [])  
     saved_prompts = session.get("saved_prompts", [])  
-  
-    images = [{'name': fn, 'url': image_container_client.get_blob_client(fn).url} for fn in image_filenames] if image_container_client else []  
-    files = [{'name': fn, 'url': file_container_client.get_blob_client(fn).url} for fn in file_filenames] if file_container_client else []  
-  
     max_displayed_history = 6  
     max_total_history = 50  
     show_all_history = session.get("show_all_history", False)  
@@ -1000,7 +1073,6 @@ def index():
         saved_prompts=saved_prompts  
     )  
   
-  
 # ------------------------------- 長文を事前登録する準備エンドポイント -------------------------------  
 @app.route('/prepare_stream', methods=['POST'])  
 def prepare_stream():  
@@ -1014,7 +1086,6 @@ def prepare_stream():
     session['prepared_prompts'] = prepared  
     session.modified = True  
     return jsonify({"message_id": mid})  
-  
   
 # ------------------------------- メッセージ送信（非SSE） -------------------------------  
 @app.route('/send_message', methods=['POST'])  
@@ -1107,6 +1178,9 @@ def send_message():
             max_history_to_send=history_to_send  
         )  
   
+        # 添付（画像/PDF）は常に添付（モデルによるガードを撤廃）  
+        model_to_use = session.get("selected_model", RESPONSES_MODEL)  
+  
         last_user_index = None  
         for i in range(len(input_items) - 1, -1, -1):  
             if input_items[i].get("role") == "user":  
@@ -1114,38 +1188,51 @@ def send_message():
                 break  
   
         if last_user_index is not None:  
+            # 画像（SAS の image_url）  
             image_filenames = session.get("image_filenames", [])  
-            for img_name in image_filenames:  
+            for img_blob in image_filenames:  
                 if not image_container_client:  
                     continue  
-                blob_client = image_container_client.get_blob_client(img_name)  
                 try:  
-                    encoded = encode_image_from_blob(blob_client)  
-                    ext = img_name.rsplit('.', 1)[-1].lower()  
-                    mime = f"image/{'jpeg' if ext == 'jpg' else ext}" if ext in ['png', 'jpeg', 'jpg', 'gif'] else 'application/octet-stream'  
-                    data_url = f"data:{mime};base64,{encoded}"  
-                    input_items[last_user_index]["content"].append({"type": "input_image", "image_url": data_url})  
-                except Exception as e:  
-                    print("画像エンコードエラー:", e)  
-                    traceback.print_exc()  
-            file_filenames = session.get("file_filenames", [])  
-            for pdf_name in file_filenames:  
-                if pdf_name.lower().endswith('.pdf'):  
-                    if not file_container_client:  
+                    blob_client = image_container_client.get_blob_client(img_blob)  
+                    props = blob_client.get_blob_properties()  
+                    if props.size and props.size > MAX_ATTACHMENT_BYTES:  
+                        print(f"画像が大きすぎるため添付スキップ: {img_blob} ({props.size} bytes)")  
                         continue  
-                    blob_client = file_container_client.get_blob_client(pdf_name)  
-                    try:  
-                        encoded = encode_pdf_from_blob(blob_client)  
-                        input_items[last_user_index]["content"].append({  
-                            "type": "input_file",  
-                            "filename": pdf_name,  
-                            "file_data": f"data:application/pdf;base64,{encoded}"  
-                        })  
-                    except Exception as e:  
-                        print("PDFエンコードエラー:", e)  
-                        traceback.print_exc()  
+                    sas_url = generate_sas_url(blob_client, img_blob)  
+                    input_items[last_user_index]["content"].append({  
+                        "type": "input_image",  
+                        "image_url": sas_url  
+                    })  
+                except Exception as e:  
+                    print("画像添付URL生成エラー:", e)  
+                    traceback.print_exc()  
   
-        model_to_use = session.get("selected_model", RESPONSES_MODEL)  
+            # PDF（Base64 の file_data + filename）  
+            file_filenames = session.get("file_filenames", [])  
+            for pdf_blob in file_filenames:  
+                if not pdf_blob.lower().endswith('.pdf'):  
+                    continue  
+                if not file_container_client:  
+                    continue  
+                try:  
+                    blob_client = file_container_client.get_blob_client(pdf_blob)  
+                    props = blob_client.get_blob_properties()  
+                    if props.size and props.size > MAX_ATTACHMENT_BYTES:  
+                        print(f"PDFが大きすぎるため添付スキップ: {pdf_blob} ({props.size} bytes)")  
+                        continue  
+                    pdf_b64 = encode_pdf_from_blob(blob_client)  
+                    filename = pdf_blob.split("/")[-1]  
+                    display = filename.split("__", 1)[1] if "__" in filename else filename  
+                    input_items[last_user_index]["content"].append({  
+                        "type": "input_file",  
+                        "filename": display,  
+                        "file_data": f"data:application/pdf;base64,{pdf_b64}",  
+                    })  
+                except Exception as e:  
+                    print("PDF添付Base64生成エラー:", e)  
+                    traceback.print_exc()  
+  
         request_kwargs = dict(model=model_to_use, input=input_items)  
         if model_to_use in REASONING_ENABLED_MODELS:  
             effort = session.get("reasoning_effort", REASONING_EFFORT)  
@@ -1179,6 +1266,11 @@ def send_message():
   
         save_chat_history()  
   
+        # 送信後に添付をクリア（毎ターン再添付を防止）  
+        session["image_filenames"] = []  
+        session["file_filenames"] = []  
+        session.modified = True  
+  
         return (  
             json.dumps({  
                 'response': assistant_html,  
@@ -1204,11 +1296,9 @@ def send_message():
             {'Content-Type': 'application/json'}  
         )  
   
-  
 # ------------------------------- SSE ストリーミング ヘルパー -------------------------------  
 def _sse_event(event_name: str, data_obj) -> str:  
     return f"event: {event_name}\ndata: {json.dumps(data_obj, ensure_ascii=False)}\n\n"  
-  
   
 # ------------------------------- SSE ストリーミング エンドポイント -------------------------------  
 @app.route('/stream_message', methods=['GET'])  
@@ -1330,34 +1420,48 @@ def stream_message():
                     break  
   
             if last_user_index is not None:  
-                for img_name in image_filenames:  
+                # 画像（SAS の image_url）を常に添付  
+                for img_blob in image_filenames:  
                     if not image_container_client:  
                         continue  
-                    blob_client = image_container_client.get_blob_client(img_name)  
                     try:  
-                        encoded = encode_image_from_blob(blob_client)  
-                        ext = img_name.rsplit('.', 1)[-1].lower()  
-                        mime = f"image/{'jpeg' if ext == 'jpg' else ext}" if ext in ['png', 'jpeg', 'jpg', 'gif'] else 'application/octet-stream'  
-                        data_url = f"data:{mime};base64,{encoded}"  
-                        input_items[last_user_index]["content"].append({"type": "input_image", "image_url": data_url})  
-                    except Exception as e:  
-                        print("画像エンコードエラー:", e)  
-                        traceback.print_exc()  
-                for pdf_name in file_filenames:  
-                    if pdf_name.lower().endswith('.pdf'):  
-                        if not file_container_client:  
+                        blob_client = image_container_client.get_blob_client(img_blob)  
+                        props = blob_client.get_blob_properties()  
+                        if props.size and props.size > MAX_ATTACHMENT_BYTES:  
+                            print(f"画像が大きすぎるため添付スキップ: {img_blob} ({props.size} bytes)")  
                             continue  
-                        blob_client = file_container_client.get_blob_client(pdf_name)  
-                        try:  
-                            encoded = encode_pdf_from_blob(blob_client)  
-                            input_items[last_user_index]["content"].append({  
-                                "type": "input_file",  
-                                "filename": pdf_name,  
-                                "file_data": f"data:application/pdf;base64,{encoded}"  
-                            })  
-                        except Exception as e:  
-                            print("PDFエンコードエラー:", e)  
-                            traceback.print_exc()  
+                        sas_url = generate_sas_url(blob_client, img_blob)  
+                        input_items[last_user_index]["content"].append({  
+                            "type": "input_image",  
+                            "image_url": sas_url  
+                        })  
+                    except Exception as e:  
+                        print("画像添付URL生成エラー:", e)  
+                        traceback.print_exc()  
+  
+                # PDF（Base64 の file_data + filename）を常に添付  
+                for pdf_blob in file_filenames:  
+                    if not pdf_blob.lower().endswith('.pdf'):  
+                        continue  
+                    if not file_container_client:  
+                        continue  
+                    try:  
+                        blob_client = file_container_client.get_blob_client(pdf_blob)  
+                        props = blob_client.get_blob_properties()  
+                        if props.size and props.size > MAX_ATTACHMENT_BYTES:  
+                            print(f"PDFが大きすぎるため添付スキップ: {pdf_blob} ({props.size} bytes)")  
+                            continue  
+                        pdf_b64 = encode_pdf_from_blob(blob_client)  
+                        filename = pdf_blob.split("/")[-1]  
+                        display = filename.split("__", 1)[1] if "__" in filename else filename  
+                        input_items[last_user_index]["content"].append({  
+                            "type": "input_file",  
+                            "filename": display,  
+                            "file_data": f"data:application/pdf;base64,{pdf_b64}",  
+                        })  
+                    except Exception as e:  
+                        print("PDF添付Base64生成エラー:", e)  
+                        traceback.print_exc()  
   
             request_kwargs = dict(model=model_to_use, input=input_items)  
             if enable_reasoning:  
@@ -1379,7 +1483,6 @@ def stream_message():
                 final_response = stream.get_final_response()  
   
             result_holder["reasoning_summary"] = extract_reasoning_summary(final_response)  
-  
             full_text = result_holder["full_text"]  
             if full_text:  
                 assistant_html = markdown2.markdown(  
@@ -1441,6 +1544,10 @@ def stream_message():
                     session["sidebar_messages"] = sidebar2  
                     session.modified = True  
                 save_chat_history()  
+            # 送信後に添付をクリア  
+            session["image_filenames"] = []  
+            session["file_filenames"] = []  
+            session.modified = True  
         except Exception as e:  
             print("SSE後処理の履歴保存エラー:", e)  
             traceback.print_exc()  
@@ -1452,7 +1559,6 @@ def stream_message():
         "Connection": "keep-alive"  
     }  
     return app.response_class(stream_with_context(generate()), headers=headers)  
-  
   
 # ------------------------------- テキスト Blob ダウンロード -------------------------------  
 @app.route("/download_txt/<container>/<path:blobname>")  
@@ -1480,7 +1586,6 @@ def download_txt(container, blobname):
         f'attachment; filename="{ascii_filename}"; filename*=UTF-8\'\'{quote(filename)}'  
     )  
     return response  
-  
   
 # ------------------------------- エントリポイント -------------------------------  
 if __name__ == '__main__':  

@@ -1,182 +1,182 @@
 html, body {  
-    width: 100%;  
-    height: 100%;  
-    margin: 0;  
-    padding: 0;  
-    overflow: hidden;  
+        width: 100%;  
+        height: 100%;  
+        margin: 0;  
+        padding: 0;  
+        overflow: hidden;  
 }  
   
 .container-fluid {  
-    padding: 0;  
-    height: 100%;  
+        padding: 0;  
+        height: 100%;  
 }  
   
 .row {  
-    height: 100%;  
-    margin: 0;  
+        height: 100%;  
+        margin: 0;  
 }  
   
 /* サイドバー */  
 .sidebar {  
-    background-color: #f8f9fa;  
-    padding: 20px;  
-    height: 100%;  
-    overflow-y: auto;  
-    overflow-x: hidden;  
+        background-color: #f8f9fa;  
+        padding: 20px;  
+        height: 100%;  
+        overflow-y: auto;  
+        overflow-x: hidden;  
 }  
   
 /* メインコンテンツ全体を縦に並べる flexbox */  
 .main-content {  
-    padding: 20px;  
-    display: flex;  
-    flex-direction: column;  
-    height: 100%;  
-    overflow: hidden;  
+        padding: 20px;  
+        display: flex;  
+        flex-direction: column;  
+        height: 100%;  
+        overflow: hidden;  
 }  
   
 /* ヘッダー・フラッシュメッセージは固定 */  
 .app-title, .flashes {  
-    flex: 0 0 auto;  
-    margin-bottom: 10px;  
+        flex: 0 0 auto;  
+        margin-bottom: 10px;  
 }  
   
 /* チャット表示領域は残りを全部使って縦スクロール */  
 .chat-box {  
-    flex: 1 1 auto;  
-    border: 1px solid #ddd;  
-    padding: 10px;  
-    background: #fff;  
-    overflow-y: auto;  
-    overflow-x: hidden;  
+        flex: 1 1 auto;  
+        border: 1px solid #ddd;  
+        padding: 10px;  
+        background: #fff;  
+        overflow-y: auto;  
+        overflow-x: hidden;  
 }  
   
 /* 入力欄は一番下に固定 */  
 .chat-input {  
-    flex: 0 0 auto;  
-    margin-top: 10px;  
+        flex: 0 0 auto;  
+        margin-top: 10px;  
 }  
   
 /* メッセージバブル */  
 .message-container {  
-    display: flex;  
-    margin-bottom: 15px;  
+        display: flex;  
+        margin-bottom: 15px;  
 }  
 .message-container.user {  
-    justify-content: flex-end;  
+        justify-content: flex-end;  
 }  
 .message-container.assistant {  
-    justify-content: flex-start;  
+        justify-content: flex-start;  
 }  
 .message-bubble {  
-    max-width: 70%;  
-    padding: 10px;  
-    border-radius: 15px;  
-    word-wrap: break-word;  
-    position: relative;  
+        max-width: 70%;  
+        padding: 10px;  
+        border-radius: 15px;  
+        word-wrap: break-word;  
+        position: relative;  
 }  
 .message-container.user .message-bubble {  
-    background-color: #dcf8c6;  
+        background-color: #dcf8c6;  
 }  
 .message-container.assistant .message-bubble {  
-    background-color: #f1f0f0;  
+        background-color: #f1f0f0;  
 }  
   
 /* Reasoning summary */  
 .reasoning-summary {  
-    font-size: 0.95em;  
-    background: #deeeff;  
-    border-left: 4px solid #1563a6;  
-    padding: 8px 14px;  
-    margin-bottom: 10px;  
-    margin-top: 8px;  
+        font-size: 0.95em;  
+        background: #deeeff;  
+        border-left: 4px solid #1563a6;  
+        padding: 8px 14px;  
+        margin-bottom: 10px;  
+        margin-top: 8px;  
 }  
   
 /* その他のスタイル（テーブル、コード等） */  
 .assistant-message table {  
-    width: 100%;  
-    border-collapse: collapse;  
-    margin-bottom: 1em;  
+        width: 100%;  
+        border-collapse: collapse;  
+        margin-bottom: 1em;  
 }  
 .assistant-message th, .assistant-message td {  
-    border: 1px solid #ddd;  
-    padding: 8px;  
+        border: 1px solid #ddd;  
+        padding: 8px;  
 }  
 .assistant-message pre {  
-    background: #f8f8f8;  
-    padding: 10px;  
-    overflow-x: auto;  
+        background: #f8f8f8;  
+        padding: 10px;  
+        overflow-x: auto;  
 }  
 .assistant-message code {  
-    background: #f8f8f8;  
-    padding: 2px 4px;  
-    border-radius: 4px;  
+        background: #f8f8f8;  
+        padding: 2px 4px;  
+        border-radius: 4px;  
 }  
   
 /* ボタン類 */  
 .sidebar-button {  
-    width: 100%;  
-    text-align: left;  
-    padding: 0;  
-    background: none;  
-    border: none;  
+        width: 100%;  
+        text-align: left;  
+        padding: 0;  
+        background: none;  
+        border: none;  
 }  
 .btn-link.sidebar-button {  
-    color: #007bff;  
+        color: #007bff;  
 }  
 .btn-link.sidebar-button:hover {  
-    color: #0056b3;  
+        color: #0056b3;  
 }  
   
 /* 見出し[この質問で検索に利用された文書] のデザイン（落ち着いた青系） */  
 #searchFilesToggle {  
-    font-size: 1.2em;  
-    font-weight: bold;  
-    color: #1563a6;  
-    background: #eaf4fb;  
-    padding: 6px 10px;  
-    border-radius: 6px;  
-    display: inline-block;  
-    margin: 6px 0;  
-    box-shadow: 0 1px 6px rgba(0,0,0,0.03);  
-    cursor: pointer;  
-    text-decoration: underline;  
-    transition: background 0.2s, color 0.2s;  
+        font-size: 1.2em;  
+        font-weight: bold;  
+        color: #1563a6;  
+        background: #eaf4fb;  
+        padding: 6px 10px;  
+        border-radius: 6px;  
+        display: inline-block;  
+        margin: 6px 0;  
+        box-shadow: 0 1px 6px rgba(0,0,0,0.03);  
+        cursor: pointer;  
+        text-decoration: underline;  
+        transition: background 0.2s, color 0.2s;  
 }  
 #searchFilesToggle:hover {  
-    background: #d0e6f7;  
-    color: #17416a;  
+        background: #d0e6f7;  
+        color: #17416a;  
 }  
   
 /* RAG文書リストのナンバリング見た目調整 */  
 #searchFilesUlContainer li {  
-    list-style: none;  
-    margin-bottom: 4px;  
+        list-style: none;  
+        margin-bottom: 4px;  
 }  
 #searchFilesUlContainer .doc-num {  
-    display: inline-block;  
-    width: 1.6em;   /* 2桁でもズレないよう固定幅 */  
-    font-weight: 600;  
-    color: #1563a6;  
+        display: inline-block;  
+        width: 1.6em;   /* 2桁でもズレないよう固定幅 */  
+        font-weight: 600;  
+        color: #1563a6;  
 }  
   
 /* クエリリライト表示 */  
 .rewritten-queries {  
-    margin-top: 6px;  
-    font-size: 0.9em;  
-    background: #fff8e6;  
-    border-left: 4px solid #f0ad4e;  
-    padding: 6px 10px;  
-    border-radius: 6px;  
+        margin-top: 6px;  
+        font-size: 0.9em;  
+        background: #fff8e6;  
+        border-left: 4px solid #f0ad4e;  
+        padding: 6px 10px;  
+        border-radius: 6px;  
 }  
 .rq-title {  
-    font-weight: 600;  
-    color: #8a6d3b;  
-    margin-bottom: 4px;  
+        font-weight: 600;  
+        color: #8a6d3b;  
+        margin-bottom: 4px;  
 }  
 .rq-list {  
-    margin: 0;  
-    padding-left: 1.2em;  
+        margin: 0;  
+        padding-left: 1.2em;  
 }  
 .rq-list li {  
-    margin-bottom: 2px;  
+        margin-bottom: 2px;  
 }  

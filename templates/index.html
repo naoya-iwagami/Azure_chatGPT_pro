@@ -1,298 +1,281 @@
 <!DOCTYPE html>  
 <html lang="ja">  
 <head>  
-    <meta charset="UTF-8">  
-    <title>PM Compass PRO</title>  
-    <link rel="stylesheet"  
-          href="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">  
-    <link rel="stylesheet"  
-          href="{{ url_for('static', filename='styles.css') }}">  
-    <link rel="stylesheet"  
-          href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.css">  
-    <style>  
-        #loadingInline { display: none; align-items: center;}  
-        #loadingInline .loading-text { font-size: 1rem; color: #333; margin-left: 0.5em;}  
-        #searchFilesDisplay {margin-bottom:1em;}  
-        #searchFilesDisplay ul {margin-bottom:0; padding-left:1.2em;}  
-        .small-muted { font-size: 0.9em; color: #666; }  
-  
-        /* 検索に利用された文書の一覧スクロール領域 */  
-        #searchFilesUlContainer {  
-            max-height: 50vh;  
-            overflow-y: auto;  
-            border: 1px solid #e0e0e0;  
-            background: #fff;  
-            margin-top: .5rem;  
-            padding: .5rem .75rem;  
-        }  
-        #searchFilesUlContainer ul {  
-            margin: 0;  
-            padding-left: 1.2em;  
-        }  
-    </style>  
+  <meta charset="UTF-8">  
+  <title>PM Compass PRO</title>  
+  <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">  
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">  
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.css">  
+  <style>  
+    #loadingInline { display: none; align-items: center;}  
+    #loadingInline .loading-text { font-size: 1rem; color: #333; margin-left: 0.5em;}  
+    #searchFilesDisplay {margin-bottom:1em;}  
+    #searchFilesDisplay ul {margin-bottom:0; padding-left:1.2em;}  
+    .small-muted { font-size: 0.9em; color: #666; }  
+    /* 検索に利用された文書の一覧スクロール領域 */  
+    #searchFilesUlContainer {  
+      max-height: 50vh;  
+      overflow-y: auto;  
+      border: 1px solid #e0e0e0;  
+      background: #fff;  
+      margin-top: .5rem;  
+      padding: .5rem .75rem;  
+    }  
+    #searchFilesUlContainer ul {  
+      margin: 0;  
+      padding-left: 1.2em;  
+    }  
+  </style>  
 </head>  
 <body>  
 <div class="container-fluid">  
-    <div class="row">  
-        <!-- サイドバー -->  
-        <div class="col-md-3 sidebar">  
-            <h4>モデル設定</h4>  
-            <form method="POST" style="margin-bottom: 1em;">  
-                <div class="form-group">  
-                    <label for="model_select">モデルを選択</label>  
-                    <select id="model_select" name="model" class="form-control" onchange="this.form.submit()">  
-                        <option value="gpt-4o" {% if session.get('selected_model') == 'gpt-4o' %}selected{% endif %}>gpt-4o</option>  
-                        <option value="gpt-4.1" {% if session.get('selected_model') == 'gpt-4.1' %}selected{% endif %}>gpt-4.1</option>  
-                        <option value="o3" {% if session.get('selected_model') == 'o3' %}selected{% endif %}>o3</option>  
-                        <option value="o4-mini" {% if session.get('selected_model') == 'o4-mini' %}selected{% endif %}>o4-mini</option>  
-                        <option value="gpt-5" {% if session.get('selected_model') == 'gpt-5' %}selected{% endif %}>gpt-5</option>  
-                    </select>  
-                    <input type="hidden" name="set_model" value="1">  
-                </div>  
-  
-                <div class="form-group">  
-                    <label for="reasoning_effort">reasoning_effort</label>  
-                    <select id="reasoning_effort" name="reasoning_effort" class="form-control"  
-                            onchange="this.form.submit()"  
-                            {% if session.get('selected_model') not in ['o3','o4-mini','gpt-5'] %}disabled{% endif %}>  
-                        {% set eff = session.get('reasoning_effort', 'high') %}  
-                        <option value="low" {% if eff == 'low' %}selected{% endif %}>low</option>  
-                        <option value="medium" {% if eff == 'medium' %}selected{% endif %}>medium</option>  
-                        <option value="high" {% if eff == 'high' %}selected{% endif %}>high</option>  
-                    </select>  
-                    <small class="form-text text-muted">  
-                        o3 / o4-mini / gpt-5 選択時のみ有効です。  
-                    </small>  
-                </div>  
-            </form>  
-  
-            <h4>検索設定</h4>  
-            <div class="small-muted">検索方法: ハイブリッド（キーワード＋セマンティック＋ベクターのRRF融合）</div>  
-            <form method="POST" style="margin-bottom: 1em; margin-top: .5em;">  
-                <div class="form-group">  
-                    <label for="index_select">検索インデックス</label>  
-                    <select id="index_select" name="search_index" class="form-control" onchange="this.form.submit()">  
-                        {% set selected_idx = session.get('selected_search_index') %}  
-                        {% for label, value in index_options %}  
-                            <option value="{{ value }}" {% if selected_idx == value %}selected{% endif %}>  
-                                {{ label }}  
-                            </option>  
-                        {% endfor %}  
-                    </select>  
-                    <input type="hidden" name="set_index" value="1">  
-                </div>  
-            </form>  
-  
-            <form method="POST" style="margin-bottom: 1em;">  
-                <div class="form-group">  
-                    <label for="doc_count">取得ドキュメント数（1～300）</label>  
-                    <input type="number" id="doc_count" name="doc_count"  
-                           class="form-control" min="1" max="300" step="1"  
-                           value="{{ session.get('doc_count', 10) }}"  
-                           onchange="this.form.submit()">  
-                    <input type="hidden" name="set_doc_count" value="1">  
-                    <small class="form-text text-muted">多くするほど文脈は増えますが、応答時間も長くなります。</small>  
-                </div>  
-            </form>  
-  
-            <form method="POST" style="margin-bottom: 1em;">  
-                <div class="form-group">  
-                    <label for="history_to_send">過去メッセージ数（1～50）</label>  
-                    <input type="number" id="history_to_send" name="history_to_send"  
-                           class="form-control" min="1" max="50" step="1"  
-                           value="{{ session.get('history_to_send', 10) }}"  
-                           onchange="this.form.submit()">  
-                    <input type="hidden" name="set_history_to_send" value="1">  
-                    <small class="form-text text-muted">モデルに渡す直近の発話数を指定します。</small>  
-                </div>  
-            </form>  
-  
-            <h5>モデルに指示を与える</h5>  
-            <!-- 現在のsystem_messageを直接編集 -->  
-            <form method="POST" style="margin-bottom: 1em;">  
-                <div class="form-group">  
-                    <textarea class="form-control" name="system_message" rows="4"  
-                        onchange="this.form.submit()"  
-                        onblur="this.form.submit()"  
-                    >{{ session.get('default_system_message', 'あなたは親切なAIアシスタントです。ユーザーの質問が不明確な場合は、「こういうことですか？」と内容を確認してください。質問が明確な場合は、簡潔かつ正確に答えてください。') }}</textarea>  
-                    <input type="hidden" name="set_system_message" value="1">  
-                </div>  
-            </form>  
-  
-            <!-- 登録済みの指示から選ぶ -->  
-            <form method="POST" style="margin-bottom: 1em;">  
-                <div class="form-group">  
-                    <label for="select_prompt_id">登録済みの指示を選択</label>  
-                    <select id="select_prompt_id" name="select_prompt_id" class="form-control" onchange="this.form.submit()">  
-                        <option value="">-- 選択してください --</option>  
-                        {% for p in saved_prompts %}  
-                            <option value="{{ p.id }}">{{ p.title }}</option>  
-                        {% endfor %}  
-                    </select>  
-                    <input type="hidden" name="apply_system_prompt" value="1">  
-                    <small class="form-text text-muted">選択すると、その内容がシステムメッセージに反映されます。</small>  
-                </div>  
-            </form>  
-  
-            <!-- 新しい指示を登録 -->  
-            <h6>指示を登録</h6>  
-            <form method="POST" style="margin-bottom: 1em;">  
-                <div class="form-group">  
-                    <label for="prompt_title">タイトル</label>  
-                    <input type="text" id="prompt_title" name="prompt_title" class="form-control" required>  
-                </div>  
-                <div class="form-group">  
-                    <label for="prompt_content">指示内容</label>  
-                    <textarea id="prompt_content" name="prompt_content" class="form-control" rows="4" required></textarea>  
-                </div>  
-                <button type="submit" class="btn btn-outline-primary">登録</button>  
-                <input type="hidden" name="add_system_prompt" value="1">  
-            </form>  
-  
-            <h4>チャット履歴</h4>  
-            <ul class="chat-history">  
-                {% if chat_sessions %}  
-                    {% set answered = chat_sessions | selectattr('first_assistant_message') | list %}  
-                    {% if not show_all_history %}  
-                        {% set display_sessions = answered[:max_displayed_history] %}  
-                    {% else %}  
-                        {% set display_sessions = answered[:max_total_history] %}  
-                    {% endif %}  
-                    {% for chat in display_sessions %}  
-                        <li>  
-                            <form method="POST">  
-                                <input type="hidden" name="select_chat"  
-                                       value="{{ chat.session_id }}">  
-                                <button type="submit" class="btn btn-link sidebar-button">  
-                                    {{ chat.first_assistant_message[:10] }}  
-                                    {% if chat.first_assistant_message|length > 10 %}…{% endif %}  
-                                </button>  
-                            </form>  
-                        </li>  
-                    {% endfor %}  
-                {% else %}  
-                    <p>チャット履歴がありません。</p>  
-                {% endif %}  
-            </ul>  
-            {% if chat_sessions|length > max_displayed_history %}  
-                <form method="POST">  
-                    <button type="submit" name="toggle_history"  
-                            class="btn btn-secondary">  
-                        {{ '少なく表示' if show_all_history else 'もっと見る' }}  
-                    </button>  
-                </form>  
-            {% endif %}  
-            <form method="POST">  
-                <button type="submit" name="new_chat" value="true"  
-                        class="btn btn-primary mt-2">新しいチャット</button>  
-            </form>  
-            <hr>  
-            <h4>ファイルアップロード（画像・PDF）</h4>  
-            <form method="POST" enctype="multipart/form-data">  
-                <div class="form-group">  
-                    <input type="file" name="files" multiple  
-                        class="form-control-file"  
-                        accept=".png,.jpg,.jpeg,.gif,.pdf"  
-                        onchange="this.form.submit()">  
-                    <input type="hidden" name="upload_files" value="1">  
-                </div>  
-            </form>  
-            {% if images %}  
-                <h5>アップロード画像</h5>  
-                {% for img in images %}  
-                    <div class="uploaded-image">  
-                        <p>{{ img.name }}</p>  
-                        <img src="{{ img.url }}" alt="{{ img.name }}" width="100%">  
-                        <form method="post">  
-                            <input type="hidden" name="delete_image"  
-                                   value="{{ img.name }}">  
-                            <button type="submit"  
-                                    class="btn btn-danger btn-sm mt-2">  
-                                削除  
-                            </button>  
-                        </form>  
-                    </div>  
-                {% endfor %}  
-            {% endif %}  
-            {% if files %}  
-                <h5>アップロードPDF</h5>  
-                {% for file in files %}  
-                    <div class="uploaded-file">  
-                        <p>  
-                            <a href="{{ file.url }}" target="_blank">{{ file.name }}</a>  
-                        </p>  
-                        <form method="post">  
-                            <input type="hidden" name="delete_file"  
-                                   value="{{ file.name }}">  
-                            <button type="submit"  
-                                    class="btn btn-danger btn-sm mt-2">  
-                                削除  
-                            </button>  
-                        </form>  
-                    </div>  
-                {% endfor %}  
-            {% endif %}  
+  <div class="row">  
+    <!-- サイドバー -->  
+    <div class="col-md-3 sidebar">  
+      <h4>モデル設定</h4>  
+      <form method="POST" style="margin-bottom: 1em;">  
+        <div class="form-group">  
+          <label for="model_select">モデルを選択</label>  
+          <select id="model_select" name="model" class="form-control" onchange="this.form.submit()">  
+            <option value="gpt-4o" {% if session.get('selected_model') == 'gpt-4o' %}selected{% endif %}>gpt-4o</option>  
+            <option value="gpt-4.1" {% if session.get('selected_model') == 'gpt-4.1' %}selected{% endif %}>gpt-4.1</option>  
+            <option value="o3" {% if session.get('selected_model') == 'o3' %}selected{% endif %}>o3</option>  
+            <option value="o4-mini" {% if session.get('selected_model') == 'o4-mini' %}selected{% endif %}>o4-mini</option>  
+            <option value="gpt-5" {% if session.get('selected_model') == 'gpt-5' %}selected{% endif %}>gpt-5</option>  
+          </select>  
+          <input type="hidden" name="set_model" value="1">  
         </div>  
-  
-        <!-- メインコンテンツ -->  
-        <div class="col-md-9 main-content">  
-            <div id="mainHeader" class="d-flex align-items-center justify-content-between mb-3">  
-                <h1 class="app-title mb-0">PM Compass PRO</h1>  
-                <div id="loadingInline">  
-                    <span class="spinner-border spinner-border-sm text-primary" role="status"></span>  
-                    <span class="loading-text">応答中です。しばらくお待ちください…</span>  
-                </div>  
-            </div>  
-  
-            {% with messages = get_flashed_messages() %}  
-            {% if messages %}  
-              <ul class="flashes">  
-                {% for m in messages %}<li>{{ m }}</li>{% endfor %}  
-              </ul>  
-            {% endif %}  
-            {% endwith %}  
-  
-            <!-- チャット表示領域 -->  
-            <div id="chatBox" class="chat-box">  
-                {% for msg in chat_history %}  
-                  <div class="message-container {% if msg.role=='user' %}user{% else %}assistant{% endif %}">  
-                      <div class="message-bubble">  
-                          {% if msg.role=='user' %}  
-                              <strong>あなた:</strong>  
-                              <p>{{ msg.content|e }}</p>  
-                          {% else %}  
-                              <strong>アシスタント:</strong>  
-                              {% if msg.type=='html' %}  
-                                  <div class="assistant-message">{{ msg.content|safe }}</div>  
-                              {% else %}  
-                                  <p>{{ msg.content|e }}</p>  
-                              {% endif %}  
-                          {% endif %}  
-                      </div>  
-                  </div>  
-                {% endfor %}  
-                <!-- Reasoning summaryはここには静的に出しません。JSで追加 -->  
-            </div>  
-  
-            <!-- RAG文書表示欄 -->  
-            <div id="searchFilesDisplay" class="alert alert-secondary" style="display:none;font-size:0.95em;"></div>  
-  
-            <!-- チャット入力欄 -->  
-            <form id="chatForm" class="chat-input">  
-                <div class="form-row">  
-                    <div class="col-10">  
-                        <textarea name="prompt" id="promptTextarea"  
-                                  class="form-control" rows="2"  
-                                  placeholder="ご質問を入力してください:"></textarea>  
-                    </div>  
-                    <div class="col-2">  
-                        <button type="submit" id="sendButton"  
-                                class="btn btn-success btn-block">送信</button>  
-                    </div>  
-                </div>  
-            </form>  
+        <div class="form-group">  
+          <label for="reasoning_effort">reasoning_effort</label>  
+          <select id="reasoning_effort" name="reasoning_effort" class="form-control"  
+                  onchange="this.form.submit()"  
+                  {% if session.get('selected_model') not in ['o3','o4-mini','gpt-5'] %}disabled{% endif %}>  
+            {% set eff = session.get('reasoning_effort', 'high') %}  
+            <option value="low" {% if eff == 'low' %}selected{% endif %}>low</option>  
+            <option value="medium" {% if eff == 'medium' %}selected{% endif %}>medium</option>  
+            <option value="high" {% if eff == 'high' %}selected{% endif %}>high</option>  
+          </select>  
+          <small class="form-text text-muted">  
+            o3 / o4-mini / gpt-5 選択時のみ有効です。  
+          </small>  
         </div>  
+      </form>  
+  
+      <h4>検索設定</h4>  
+      <div class="small-muted">検索方法: ハイブリッド（キーワード＋セマンティック＋ベクターのRRF融合）</div>  
+      <form method="POST" style="margin-bottom: 1em; margin-top: .5em;">  
+        <div class="form-group">  
+          <label for="index_select">検索インデックス</label>  
+          <select id="index_select" name="search_index" class="form-control" onchange="this.form.submit()">  
+            {% set selected_idx = session.get('selected_search_index') %}  
+            {% for label, value in index_options %}  
+              <option value="{{ value }}" {% if selected_idx == value %}selected{% endif %}>  
+                {{ label }}  
+              </option>  
+            {% endfor %}  
+          </select>  
+          <input type="hidden" name="set_index" value="1">  
+        </div>  
+      </form>  
+  
+      <form method="POST" style="margin-bottom: 1em;">  
+        <div class="form-group">  
+          <label for="doc_count">取得ドキュメント数（1～300）</label>  
+          <input type="number" id="doc_count" name="doc_count"  
+                 class="form-control" min="1" max="300" step="1"  
+                 value="{{ session.get('doc_count', 10) }}"  
+                 onchange="this.form.submit()">  
+          <input type="hidden" name="set_doc_count" value="1">  
+          <small class="form-text text-muted">多くするほど文脈は増えますが、応答時間も長くなります。</small>  
+        </div>  
+      </form>  
+  
+      <form method="POST" style="margin-bottom: 1em;">  
+        <div class="form-group">  
+          <label for="history_to_send">過去メッセージ数（1～50）</label>  
+          <input type="number" id="history_to_send" name="history_to_send"  
+                 class="form-control" min="1" max="50" step="1"  
+                 value="{{ session.get('history_to_send', 10) }}"  
+                 onchange="this.form.submit()">  
+          <input type="hidden" name="set_history_to_send" value="1">  
+          <small class="form-text text-muted">モデルに渡す直近の発話数を指定します。</small>  
+        </div>  
+      </form>  
+  
+      <h5>モデルに指示を与える</h5>  
+      <!-- 現在のsystem_messageを直接編集 -->  
+      <form method="POST" style="margin-bottom: 1em;">  
+        <div class="form-group">  
+          <textarea class="form-control" name="system_message" rows="4"  
+                    onchange="this.form.submit()"  
+                    onblur="this.form.submit()"  
+          >{{ session.get('default_system_message', 'あなたは親切なAIアシスタントです。ユーザーの質問が不明確な場合は、「こういうことですか？」と内容を確認してください。質問が明確な場合は、簡潔かつ正確に答えてください。') }}</textarea>  
+          <input type="hidden" name="set_system_message" value="1">  
+        </div>  
+      </form>  
+  
+      <!-- 登録済みの指示から選ぶ -->  
+      <form method="POST" style="margin-bottom: 1em;">  
+        <div class="form-group">  
+          <label for="select_prompt_id">登録済みの指示を選択</label>  
+          <select id="select_prompt_id" name="select_prompt_id" class="form-control" onchange="this.form.submit()">  
+            <option value="">-- 選択してください --</option>  
+            {% for p in saved_prompts %}  
+              <option value="{{ p.id }}">{{ p.title }}</option>  
+            {% endfor %}  
+          </select>  
+          <input type="hidden" name="apply_system_prompt" value="1">  
+          <small class="form-text text-muted">選択すると、その内容がシステムメッセージに反映されます。</small>  
+        </div>  
+      </form>  
+  
+      <!-- 新しい指示を登録 -->  
+      <h6>指示を登録</h6>  
+      <form method="POST" style="margin-bottom: 1em;">  
+        <div class="form-group">  
+          <label for="prompt_title">タイトル</label>  
+          <input type="text" id="prompt_title" name="prompt_title" class="form-control" required>  
+        </div>  
+        <div class="form-group">  
+          <label for="prompt_content">指示内容</label>  
+          <textarea id="prompt_content" name="prompt_content" class="form-control" rows="4" required></textarea>  
+        </div>  
+        <button type="submit" class="btn btn-outline-primary">登録</button>  
+        <input type="hidden" name="add_system_prompt" value="1">  
+      </form>  
+  
+      <h4>チャット履歴</h4>  
+      <ul class="chat-history">  
+        {% if chat_sessions %}  
+          {% set answered = chat_sessions | selectattr('first_assistant_message') | list %}  
+          {% if not show_all_history %}  
+            {% set display_sessions = answered[:max_displayed_history] %}  
+          {% else %}  
+            {% set display_sessions = answered[:max_total_history] %}  
+          {% endif %}  
+          {% for chat in display_sessions %}  
+            <li>  
+              <form method="POST">  
+                <input type="hidden" name="select_chat" value="{{ chat.session_id }}">  
+                <button type="submit" class="btn btn-link sidebar-button">  
+                  {{ chat.first_assistant_message[:10] }}  
+                  {% if chat.first_assistant_message|length > 10 %}…{% endif %}  
+                </button>  
+              </form>  
+            </li>  
+          {% endfor %}  
+        {% else %}  
+          <p>チャット履歴がありません。</p>  
+        {% endif %}  
+      </ul>  
+      {% if chat_sessions|length > max_displayed_history %}  
+        <form method="POST">  
+          <button type="submit" name="toggle_history" class="btn btn-secondary">  
+            {{ '少なく表示' if show_all_history else 'もっと見る' }}  
+          </button>  
+        </form>  
+      {% endif %}  
+      <form method="POST">  
+        <button type="submit" name="new_chat" value="true" class="btn btn-primary mt-2">新しいチャット</button>  
+      </form>  
+      <hr>  
+  
+      <h4>ファイルアップロード（画像・PDF）</h4>  
+      <form method="POST" enctype="multipart/form-data">  
+        <div class="form-group">  
+          <input type="file" name="files" multiple  
+                 class="form-control-file"  
+                 accept=".png,.jpg,.jpeg,.gif,.pdf"  
+                 onchange="this.form.submit()">  
+          <input type="hidden" name="upload_files" value="1">  
+        </div>  
+      </form>  
+  
+      {% if images %}  
+      <h5>アップロード画像</h5>  
+      {% for img in images %}  
+        <div class="uploaded-image">  
+          <p>{{ img.name }}</p>  
+          <img src="{{ img.url }}" alt="{{ img.name }}" width="100%">  
+          <form method="post">  
+            <input type="hidden" name="delete_image" value="{{ img.blob }}">  
+            <button type="submit" class="btn btn-danger btn-sm mt-2">削除</button>  
+          </form>  
+        </div>  
+      {% endfor %}  
+      {% endif %}  
+  
+      {% if files %}  
+      <h5>アップロードPDF</h5>  
+      {% for f in files %}  
+        <div class="uploaded-file">  
+          <p><a href="{{ f.url }}" target="_blank" rel="noopener">{{ f.name }}</a></p>  
+          <form method="post">  
+            <input type="hidden" name="delete_file" value="{{ f.blob }}">  
+            <button type="submit" class="btn btn-danger btn-sm mt-2">削除</button>  
+          </form>  
+        </div>  
+      {% endfor %}  
+      {% endif %}  
     </div>  
+  
+    <!-- メインコンテンツ -->  
+    <div class="col-md-9 main-content">  
+      <div id="mainHeader" class="d-flex align-items-center justify-content-between mb-3">  
+        <h1 class="app-title mb-0">PM Compass PRO</h1>  
+        <div id="loadingInline">  
+          <span class="spinner-border spinner-border-sm text-primary" role="status"></span>  
+          <span class="loading-text">応答中です。しばらくお待ちください…</span>  
+        </div>  
+      </div>  
+  
+      {% with messages = get_flashed_messages() %}  
+      {% if messages %}  
+        <ul class="flashes">  
+        {% for m in messages %}<li>{{ m }}</li>{% endfor %}  
+        </ul>  
+      {% endif %}  
+      {% endwith %}  
+  
+      <!-- チャット表示領域 -->  
+      <div id="chatBox" class="chat-box">  
+        {% for msg in chat_history %}  
+          <div class="message-container {% if msg.role=='user' %}user{% else %}assistant{% endif %}">  
+            <div class="message-bubble">  
+              {% if msg.role=='user' %}  
+                <strong>あなた:</strong>  
+                <p>{{ msg.content|e }}</p>  
+              {% else %}  
+                <strong>アシスタント:</strong>  
+                {% if msg.type=='html' %}  
+                  <div class="assistant-message">{{ msg.content|safe }}</div>  
+                {% else %}  
+                  <p>{{ msg.content|e }}</p>  
+                {% endif %}  
+              {% endif %}  
+            </div>  
+          </div>  
+        {% endfor %}  
+        <!-- Reasoning summaryはここには静的に出しません。JSで追加 -->  
+      </div>  
+  
+      <!-- RAG文書表示欄 -->  
+      <div id="searchFilesDisplay" class="alert alert-secondary" style="display:none;font-size:0.95em;"></div>  
+  
+      <!-- チャット入力欄 -->  
+      <form id="chatForm" class="chat-input">  
+        <div class="form-row">  
+          <div class="col-10">  
+            <textarea name="prompt" id="promptTextarea" class="form-control" rows="2"  
+                      placeholder="ご質問を入力してください:"></textarea>  
+          </div>  
+          <div class="col-2">  
+            <button type="submit" id="sendButton" class="btn btn-success btn-block">送信</button>  
+          </div>  
+        </div>  
+      </form>  
+    </div>  
+  </div>  
 </div>  
   
 <div id="docModalContainer"></div>  
@@ -349,7 +332,7 @@ document.addEventListener('DOMContentLoaded', function() {
     return bubble;  
   }  
   
-  // 任意改善版: リライト結果をユーザーメッセージ直下に表示（base_query と needs_clarification を利用）  
+  // 任意改善版: リライト結果をユーザーメッセージ直下に表示  
   function renderRewrittenQueriesUnder(targetBubbleEl, payload) {  
     try {  
       if (!targetBubbleEl) return;  
@@ -361,7 +344,6 @@ document.addEventListener('DOMContentLoaded', function() {
       const baseQuery = (typeof payload?.base_query === 'string' ? payload.base_query.trim() : '');  
       const clarify = payload?.needs_clarification === true;  
   
-      // 既存があれば置き換え  
       const old = targetBubbleEl.querySelector('.rewritten-queries');  
       if (old) old.remove();  
   
@@ -375,7 +357,6 @@ document.addEventListener('DOMContentLoaded', function() {
       const list = document.createElement('ul');  
       list.className = 'rq-list';  
   
-      // 基準クエリ（重複しない場合のみ先頭に表示）  
       if (baseQuery && !queries.includes(baseQuery)) {  
         const li0 = document.createElement('li');  
         li0.textContent = baseQuery + '（基準）';  
@@ -420,7 +401,6 @@ document.addEventListener('DOMContentLoaded', function() {
   }  
   
   function appendAssistantMessage(html) {  
-    // フォールバック時の一括表示用  
     const c = document.createElement('div');  
     c.className = 'message-container assistant';  
     c.innerHTML = `<div class="message-bubble">  
@@ -501,7 +481,7 @@ document.addEventListener('DOMContentLoaded', function() {
     .then(({ message_id }) => {  
       if (!message_id) throw new Error('no message_id');  
   
-      // 2) SSE開始（短いIDのみクエリに付与）  
+      // 2) SSE開始  
       const es = new EventSource('/stream_message?mid=' + encodeURIComponent(message_id));  
   
       es.addEventListener('rewritten_queries', ev => {  
@@ -566,7 +546,7 @@ document.addEventListener('DOMContentLoaded', function() {
     });  
   }  
   
-  // 既存の fetch(JSON) へのフォールバック（EventSource 非対応時用）  
+  // 既存の fetch(JSON) へのフォールバック  
   function fallbackJsonSubmit(prompt) {  
     sendButton.disabled = true;  
     showLoading();  
@@ -583,7 +563,13 @@ document.addEventListener('DOMContentLoaded', function() {
         renderRewrittenQueriesUnder(lastUserBubbleEl, { queries: data.rewritten_queries });  
       }  
       if (data.response) {  
-        appendAssistantMessage(data.response);  
+        const c = document.createElement('div');  
+        c.className = 'message-container assistant';  
+        c.innerHTML = `<div class="message-bubble">  
+            <strong>アシスタント:</strong>  
+            <div class="assistant-message">${data.response}</div>  
+          </div>`;  
+        chatBox.appendChild(c);  
       }  
       if (Array.isArray(data.search_files) && data.search_files.length > 0) {  
         renderSearchFiles(data.search_files);  
@@ -607,7 +593,7 @@ document.addEventListener('DOMContentLoaded', function() {
     e.preventDefault();  
     const prompt = promptTextarea.value.trim();  
     if (!prompt) return;  
-    const bubble = appendUserMessage(prompt); // ユーザー発話の直下にリライト結果を差し込むため参照を保持  
+    const bubble = appendUserMessage(prompt);  
     lastUserBubbleEl = bubble;  
     promptTextarea.value = '';  
   
@@ -659,6 +645,41 @@ document.addEventListener('DOMContentLoaded', function() {
   // 初期スクロール  
   (function(){ chatBox.scrollTop = chatBox.scrollHeight; })();  
 });  
+</script>  
+  
+<!-- 最後のタブ/ウィンドウが閉じられたときにセッションのアップロードを自動削除 -->  
+<script>  
+(function(){  
+  if (!('sendBeacon' in navigator)) { return; }  
+  const KEY = 'pmc_active_tabs';  
+  let cleaned = false;  
+  
+  function get() {  
+    try { return parseInt(localStorage.getItem(KEY) || '0', 10) || 0; }  
+    catch (e) { return 0; }  
+  }  
+  function set(v) { try { localStorage.setItem(KEY, String(v)); } catch (e) {} }  
+  function inc() { set(get() + 1); }  
+  function dec() { const v = Math.max(0, get() - 1); set(v); return v; }  
+  
+  function sendCleanupOnce() {  
+    if (cleaned) return;  
+    cleaned = true;  
+    const remaining = dec();  
+    if (remaining === 0) {  
+      const payload = JSON.stringify({ reason: 'session_end' });  
+      const blob = new Blob([payload], { type: 'application/json' });  
+      navigator.sendBeacon('{{ url_for("cleanup_session_files") }}', blob);  
+    }  
+  }  
+  
+  window.addEventListener('pageshow', inc, { once: true });  
+  window.addEventListener('pagehide', sendCleanupOnce, { capture: true });  
+  window.addEventListener('beforeunload', sendCleanupOnce);  
+  document.addEventListener('visibilitychange', function () {  
+    if (document.visibilityState === 'hidden') sendCleanupOnce();  
+  });  
+})();  
 </script>  
 </body>  
 </html>  
