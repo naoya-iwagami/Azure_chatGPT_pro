@@ -36,7 +36,7 @@
       <form method="POST" style="margin-bottom: 1em;">  
         <div class="form-group">  
           <label for="model_select">モデルを選択</label>  
-          <select id="model_select" name="model" class="form-control" onchange="this.form.submit()">  
+          <select id="model_select" name="model" class="form-control">  
             <option value="gpt-4o" {% if session.get('selected_model') == 'gpt-4o' %}selected{% endif %}>gpt-4o</option>  
             <option value="gpt-4.1" {% if session.get('selected_model') == 'gpt-4.1' %}selected{% endif %}>gpt-4.1</option>  
             <option value="o3" {% if session.get('selected_model') == 'o3' %}selected{% endif %}>o3</option>  
@@ -48,7 +48,6 @@
         <div class="form-group">  
           <label for="reasoning_effort">reasoning_effort</label>  
           <select id="reasoning_effort" name="reasoning_effort" class="form-control"  
-                  onchange="this.form.submit()"  
                   {% if session.get('selected_model') not in ['o3','o4-mini','gpt-5'] %}disabled{% endif %}>  
             {% set eff = session.get('reasoning_effort', 'high') %}  
             <option value="low" {% if eff == 'low' %}selected{% endif %}>low</option>  
@@ -66,7 +65,7 @@
       <form method="POST" style="margin-bottom: 1em; margin-top: .5em;">  
         <div class="form-group">  
           <label for="index_select">検索インデックス</label>  
-          <select id="index_select" name="search_index" class="form-control" onchange="this.form.submit()">  
+          <select id="index_select" name="search_index" class="form-control">  
             {% set selected_idx = session.get('selected_search_index') %}  
             {% for label, value in index_options %}  
               <option value="{{ value }}" {% if selected_idx == value %}selected{% endif %}>  
@@ -83,8 +82,7 @@
           <label for="doc_count">取得ドキュメント数（1～300）</label>  
           <input type="number" id="doc_count" name="doc_count"  
                  class="form-control" min="1" max="300" step="1"  
-                 value="{{ session.get('doc_count', 10) }}"  
-                 onchange="this.form.submit()">  
+                 value="{{ session.get('doc_count', 10) }}">  
           <input type="hidden" name="set_doc_count" value="1">  
           <small class="form-text text-muted">多くするほど文脈は増えますが、応答時間も長くなります。</small>  
         </div>  
@@ -95,20 +93,29 @@
           <label for="history_to_send">過去メッセージ数（1～50）</label>  
           <input type="number" id="history_to_send" name="history_to_send"  
                  class="form-control" min="1" max="50" step="1"  
-                 value="{{ session.get('history_to_send', 10) }}"  
-                 onchange="this.form.submit()">  
+                 value="{{ session.get('history_to_send', 10) }}">  
           <input type="hidden" name="set_history_to_send" value="1">  
           <small class="form-text text-muted">モデルに渡す直近の発話数を指定します。</small>  
         </div>  
       </form>  
+  
+      <!-- RAG ON/OFF スイッチ -->  
+      <div class="form-group">  
+        <div class="custom-control custom-switch">  
+          <input type="checkbox" class="custom-control-input" id="ragEnabled"  
+                 {% if session.get('rag_enabled', True) %}checked{% endif %}>  
+          <label class="custom-control-label" for="ragEnabled">RAGを使用する</label>  
+        </div>  
+        <small class="form-text text-muted">  
+          OFFにすると社内検索を行わず、会話と添付のみで回答します。  
+        </small>  
+      </div>  
   
       <h5>モデルに指示を与える</h5>  
       <!-- 現在のsystem_messageを直接編集 -->  
       <form method="POST" style="margin-bottom: 1em;">  
         <div class="form-group">  
           <textarea class="form-control" name="system_message" rows="4"  
-                    onchange="this.form.submit()"  
-                    onblur="this.form.submit()"  
           >{{ session.get('default_system_message', 'あなたは親切なAIアシスタントです。ユーザーの質問が不明確な場合は、「こういうことですか？」と内容を確認してください。質問が明確な場合は、簡潔かつ正確に答えてください。') }}</textarea>  
           <input type="hidden" name="set_system_message" value="1">  
         </div>  
@@ -287,6 +294,10 @@
   二段階方式のSSE:  
   1) /prepare_stream にPOSTして message_id を取得  
   2) /stream_message?mid=... に EventSource で接続（URL長制限回避）  
+  
+  追加:  
+  - サイドバー設定のAJAX反映 (/update_settings)  
+  - RAG ON/OFF スイッチ  
 */  
 document.addEventListener('DOMContentLoaded', function() {  
   const promptTextarea = document.getElementById('promptTextarea');  
@@ -644,6 +655,83 @@ document.addEventListener('DOMContentLoaded', function() {
   
   // 初期スクロール  
   (function(){ chatBox.scrollTop = chatBox.scrollHeight; })();  
+  
+  // ------------------ 設定変更のAJAX反映 ------------------  
+  function postSettings(payload) {  
+    return fetch('/update_settings', {  
+      method: 'POST',  
+      headers: { 'Content-Type': 'application/json' },  
+      body: JSON.stringify(payload)  
+    }).then(r => {  
+      if (!r.ok) throw new Error('update_settings failed');  
+      return r.json();  
+    }).catch(e => console.error(e));  
+  }  
+  
+  // モデル選択と reasoning_effort 有効/無効  
+  const modelSelect = document.getElementById('model_select');  
+  const reasoningEffortSelect = document.getElementById('reasoning_effort');  
+  function updateReasoningSelectState(model) {  
+    const enabledModels = ['o3','o4-mini','gpt-5']; // 対応モデル  
+    if (reasoningEffortSelect) {  
+      reasoningEffortSelect.disabled = !enabledModels.includes(model);  
+    }  
+  }  
+  if (modelSelect) {  
+    modelSelect.addEventListener('change', function() {  
+      const model = this.value;  
+      postSettings({ selected_model: model }).then(() => updateReasoningSelectState(model));  
+    });  
+    // 初期反映  
+    updateReasoningSelectState(modelSelect.value);  
+  }  
+  if (reasoningEffortSelect) {  
+    reasoningEffortSelect.addEventListener('change', function() {  
+      postSettings({ reasoning_effort: this.value });  
+    });  
+  }  
+  
+  // 検索インデックス  
+  const indexSelect = document.getElementById('index_select');  
+  if (indexSelect) {  
+    indexSelect.addEventListener('change', function() {  
+      postSettings({ selected_search_index: this.value });  
+    });  
+  }  
+  
+  // ドキュメント数  
+  const docCountInput = document.getElementById('doc_count');  
+  if (docCountInput) {  
+    docCountInput.addEventListener('change', function() {  
+      const v = parseInt(this.value, 10);  
+      postSettings({ doc_count: isNaN(v) ? 10 : v });  
+    });  
+  }  
+  
+  // 履歴数  
+  const histInput = document.getElementById('history_to_send');  
+  if (histInput) {  
+    histInput.addEventListener('change', function() {  
+      const v = parseInt(this.value, 10);  
+      postSettings({ history_to_send: isNaN(v) ? 10 : v });  
+    });  
+  }  
+  
+  // system_message（blurで送る）  
+  const sysMsgTextarea = document.querySelector('textarea[name="system_message"]');  
+  if (sysMsgTextarea) {  
+    sysMsgTextarea.addEventListener('blur', function() {  
+      postSettings({ default_system_message: this.value });  
+    });  
+  }  
+  
+  // RAGスイッチ  
+  const ragSwitch = document.getElementById('ragEnabled');  
+  if (ragSwitch) {  
+    ragSwitch.addEventListener('change', function() {  
+      postSettings({ rag_enabled: this.checked });  
+    });  
+  }  
 });  
 </script>  
   
