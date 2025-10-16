@@ -1,17 +1,23 @@
 #!/usr/bin/env python3  # -*- coding: utf-8 -*-  
 """  
-PM Compass – Flask アプリ（PDFアップロード＆分析対応版, 埋め込み分離 + RRFオーバーフェッチ対応 + SSEストリーミング対応, シンプルクエリリライト版）  
+PM Compass – Flask アプリ（修正版：Cosmos優先マージ保存 + current_session_id安定化 + 初回は必ず新規チャット起動）  
 - 画像/PDFアップロード対応（input_image / input_file）  
 - セッション終了時の自動削除（sendBeacon + /cleanup_session_files）  
 - Azure Cognitive Search ハイブリッド検索（RRF融合）  
 - Azure OpenAI Responses API（ストリーミング対応）  
 - PDF は file_data(Base64) + filename 方式で添付（file_url は使用しない）  
-- アプリ側のステップ制御（Step1/Step2判定）を廃止し、LLM側のプロンプト判断に委ねる  
+- アプリ側のステップ制御を廃止、LLM判断に委譲  
   
-変更点  
-- サイドバー設定のAJAX更新 /update_settings を追加  
-- RAG ON/OFF をセッションで管理（rag_enabled）  
-- RAG OFF時は検索/リライト/HyDE/PRFをスキップして会話＋添付のみ  
+追加修正（最後のメッセージしか残らない対策）  
+- ensure_messages_from_cosmos: セッションが途切れても Cosmos から履歴復元  
+- merge_messages: 既存履歴と新履歴を重複除去しながらマージ  
+- persist_assistant_message: Cosmosをソースに読み戻してから append→upsert→セッション/サイドバー反映  
+- send_message/stream_message 開始時に Cosmos 復元  
+- JSONフォールバックのレスポンスに session_id を同梱  
+- フロント: SSE final 受信時に #currentSession の data-session-id を更新  
+  
+追加修正（アプリ起動時は常に新規チャット）  
+- index 初回 GET（セッション未初期化）で必ず start_new_chat() を実行し、前回のチャットを自動で開かない  
 """  
   
 import os  
@@ -53,6 +59,21 @@ from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPerm
 from openai import AzureOpenAI  
 import markdown2  
   
+# RAGAS（任意依存）  
+try:  
+    from datasets import Dataset  
+    from ragas import evaluate  
+    from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_relevancy  
+    from ragas.integrations.langchain import LangchainLLMWrapper, LangchainEmbeddingsWrapper  
+    from langchain_openai import ChatOpenAI, OpenAIEmbeddings  
+    RAGAS_AVAILABLE = True  
+except Exception:  
+    RAGAS_AVAILABLE = False  
+  
+# 会社プロキシ（必要なら）  
+os.environ['HTTP_PROXY'] = os.getenv('HTTP_PROXY', 'http://g3.konicaminolta.jp:8080')  
+os.environ['HTTPS_PROXY'] = os.getenv('HTTPS_PROXY', 'http://g3.konicaminolta.jp:8080')  
+  
 # ------------------------------- Azure OpenAI クライアント設定 -------------------------------  
 client = AzureOpenAI(  
     api_key=os.getenv("AZURE_OPENAI_KEY"),  
@@ -85,8 +106,7 @@ RRF_FETCH_MULTIPLIER = float(os.getenv("RRF_FETCH_MULTIPLIER", "3.0"))
 RRF_FETCH_MAX_TOP = int(os.getenv("RRF_FETCH_MAX_TOP", "300"))  
   
 MAX_CHUNKS_PER_PARENT = int(os.getenv("MAX_CHUNKS_PER_PARENT", "0"))  
-  
-REWRITE_MODEL = "gpt-4o"  # 固定  
+REWRITE_MODEL = "gpt-4o"  
 MAX_REWRITE_TURNS = max(1, min(8, int(os.getenv("MAX_REWRITE_TURNS", "4"))))  
   
 ENABLE_HYDE = os.getenv("ENABLE_HYDE", "1") not in ("0", "false", "False")  
@@ -97,12 +117,16 @@ MIN_UNIQUE_PARENTS_ABS = int(os.getenv("MIN_UNIQUE_PARENTS_ABS", "3"))
 # 添付の最大バイト（超過時は添付スキップ）  
 MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(5 * 1024 * 1024)))  # 5MB  
   
+# RAGAS フラグ  
+ENABLE_RAGAS = os.getenv("ENABLE_RAGAS", "1") not in ("0", "false", "False")  
+  
 # ------------------------------- Flask アプリ設定 -------------------------------  
 app = Flask(__name__)  
 app.secret_key = os.getenv('FLASK_SECRET_KEY', 'your-default-secret-key')  
 app.config['SESSION_TYPE'] = 'filesystem'  
 app.config['SESSION_FILE_DIR'] = '/tmp/flask_session'  
 app.config['SESSION_PERMANENT'] = False  
+app.config['MAX_CONTENT_LENGTH'] = int(os.getenv("MAX_UPLOAD_MB", "100")) * 1024 * 1024  # 100MB  
 os.makedirs(app.config['SESSION_FILE_DIR'], exist_ok=True)  
 Session(app)  
   
@@ -119,7 +143,7 @@ def _build_requests_transport():
     conn_timeout = int(os.getenv("AZURE_HTTP_CONN_TIMEOUT", "20"))  
     read_timeout = int(os.getenv("AZURE_HTTP_READ_TIMEOUT", "120"))  
     return RequestsTransport(  
-        connection_verify=verify_path,  # verify ではなく connection_verify  
+        connection_verify=verify_path,  
         proxies=proxies or None,  
         connection_timeout=conn_timeout,  
         read_timeout=read_timeout,  
@@ -153,13 +177,12 @@ else:
 blob_connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")  
 blob_service_client = BlobServiceClient.from_connection_string(  
     blob_connection_string,  
-    transport=transport  
-) if blob_connection_string else None  
+    transport=transport) if blob_connection_string else None  
   
 image_container_name = 'chatgpt-image'  
 file_container_name = 'chatgpt-files'  
   
-# コンテナ自動作成（既存ならスキップ）  
+# コンテナ自動作成  
 image_container_client = None  
 file_container_client = None  
 if blob_service_client:  
@@ -265,6 +288,22 @@ def strip_html_tags(html: str) -> str:
     text = re.sub(r'<[^>]+>', '', html)  
     return text  
   
+def compute_first_assistant_title(messages, limit=30) -> str:  
+    try:  
+        for m in (messages or []):  
+            if m.get("role") == "assistant":  
+                t = (m.get("text") or strip_html_tags(m.get("content", ""))).strip()  
+                if t:  
+                    return t[:limit]  
+        for m in (messages or []):  
+            if m.get("role") == "user":  
+                t = (m.get("content") or "").strip()  
+                if t:  
+                    return t[:limit]  
+    except Exception:  
+        pass  
+    return ""  
+  
 def extract_reasoning_summary(resp) -> str:  
     try:  
         for out in getattr(resp, "output", []):  
@@ -352,31 +391,68 @@ def resolve_blob_from_filepath(selected_index: str, path_or_url: str):
     return container, blobname  
   
 # ------------------------------- クエリリライト -------------------------------  
-def rewrite_query(user_input: str, recent_messages: list) -> str:  
-    prompt = (  
-        "あなたは社内情報検索のためのアシスタントです。\n"  
-        "以下の会話履歴とユーザーの最新質問をもとに、検索エンジンに適した簡潔で明確な日本語クエリを生成してください。\n"  
-        "不要な会話表現や雑談は除外し、検索意図を正確に反映したキーワードやフレーズを含めてください。\n"  
-        "【会話履歴】\n"  
-    )  
-    for msg in (recent_messages or []):  
-        prompt += f"- {msg}\n"  
-    prompt += f"【ユーザー質問】\n{user_input}\n"  
-    prompt += "【検索用クエリ】"  
+def rewrite_queries_for_search_responses(messages: list, current_prompt: str, system_message: str = "") -> list:  
+    max_query_history_turns = min(3, MAX_REWRITE_TURNS)  
   
-    input_items = [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}]  
+    filtered = [m for m in (messages or []) if m.get("role") in ("user", "assistant")]  
+  
+    def _to_plain(m):  
+        if m.get("role") == "assistant":  
+            return m.get("text") or strip_html_tags(m.get("content", "")) or ""  
+        return m.get("content", "") or ""  
+    recent = filtered[-(max_query_history_turns * 3):]  
+    history_lines = []  
+    if system_message:  
+        history_lines.append(f"system:{system_message}")  
+    for m in recent:  
+        history_lines.append(f"{m.get('role')}:{_to_plain(m)}")  
+    context = "\n".join(history_lines)  
+  
+    system_prompt = (  
+        "あなたは社内文書検索クエリ生成AIです。\n"  
+        "出力仕様: {\"queries\":[\"...\", \"...\"]} の JSON を 1 行だけ返す。\n"  
+        "・各クエリは30文字以内、日本語主体、必要なら英語同義語併記。\n"  
+        "・最大10件生成。\n"  
+        "・説明・前後の余分な文字・改行は禁止。"  
+    )  
+    user_prompt = (  
+        f"history{{{context}}}\n"  
+        f"endtask ユーザの意図を最もよく表す検索クエリを最大10件生成してください。\n"  
+        f"最新ユーザ質問: {current_prompt}"  
+    )  
+  
+    input_items = [  
+        {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},  
+        {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},  
+    ]  
     resp = client.responses.create(  
         model=REWRITE_MODEL,  
         input=input_items,  
-        temperature=0.5,  
+        temperature=0.05,  
         max_output_tokens=256,  
-        store=False  # サーバー側に履歴を保存しない  
+        store=False  
     )  
-    rewritten = (extract_output_text(resp) or "").strip()  
-    rewritten = rewritten.strip().strip('「」"\' 　')  
-    return rewritten  
+    raw = (extract_output_text(resp) or "").strip()  
   
-# ------------------------------- 認証/履歴/指示テンプレート -------------------------------  
+    try:  
+        start = raw.find("{")  
+        end = raw.rfind("}")  
+        if start != -1 and end != -1 and end > start:  
+            raw = raw[start:end + 1]  
+        obj = json.loads(raw)  
+        qs = obj.get("queries", [])  
+        if not isinstance(qs, list):  
+            qs = []  
+    except Exception:  
+        qs = []  
+  
+    qs = [q.strip()[:30] for q in qs if isinstance(q, str) and q.strip()]  
+    qs = list(dict.fromkeys(qs))[:10]  
+    if not qs:  
+        qs = [current_prompt.strip()[:30] or "検索"]  
+    return qs  
+  
+# ------------------------------- 認証/履歴等 -------------------------------  
 def get_authenticated_user():  
     if "user_id" in session and "user_name" in session:  
         return session["user_id"]  
@@ -402,31 +478,189 @@ def get_authenticated_user():
     session["user_name"] = "anonymous"  
     return session["user_id"]  
   
+def compute_has_assistant(msgs: list) -> bool:  
+    return any(  
+        (m.get("role") == "assistant") and  
+        ((m.get("text") or strip_html_tags(m.get("content", ""))).strip())  
+        for m in (msgs or [])  
+    )  
+  
+def ensure_messages_from_cosmos(active_sid: str) -> list:  
+    """CosmosDBから当該セッションのメッセージを取得（存在しない/エラー時は[]）"""  
+    if not (container and active_sid):  
+        return []  
+    with lock:  
+        try:  
+            user_id = get_authenticated_user()  
+            item = container.read_item(item=active_sid, partition_key=user_id)  
+            return item.get("messages", []) or []  
+        except Exception:  
+            return []  
+  
+def merge_messages(existing: list, new: list) -> list:  
+    """既存と新規の配列を「role + (text or content)」で重複除去して結合（順序はexisting→new）"""  
+    existing = existing or []  
+    new = new or []  
+    if not existing:  
+        return new  
+    if not new:  
+        return existing  
+  
+    def fp(m):  
+        role = m.get("role")  
+        text = m.get("text") or strip_html_tags(m.get("content", "")) or ""  
+        return f"{role}|{text}".strip()  
+  
+    seen = set()  
+    merged = []  
+    for m in existing + new:  
+        key = fp(m)  
+        if not key:  
+            continue  
+        if key not in seen:  
+            seen.add(key)  
+            merged.append(m)  
+    return merged  
+  
+def persist_assistant_message(active_sid: str, assistant_html: str, full_text: str, ragas_scores: dict, system_message: str):  
+    """Cosmosを基点にアシスタント応答を安全に保存し、セッションとサイドバーを同期"""  
+    if not active_sid:  
+        return  
+  
+    existing_msgs = ensure_messages_from_cosmos(active_sid)  
+    session_msgs = session.get("main_chat_messages", [])  
+    candidate_msgs = (session_msgs or []) + [{  
+        "role": "assistant",  
+        "content": assistant_html,  
+        "type": "html",  
+        "text": full_text,  
+        "ragas": ragas_scores or {}  
+    }]  
+    merged_msgs = merge_messages(existing_msgs, candidate_msgs)  
+  
+    if not compute_has_assistant(merged_msgs):  
+        return  
+  
+    with lock:  
+        try:  
+            user_id = get_authenticated_user()  
+            user_name = session.get("user_name", "anonymous")  
+  
+            sb = session.get("sidebar_messages", [])  
+            sys_msg = system_message or session.get("default_system_message", "あなたは親切なAIアシスタントです…")  
+            if active_sid and sb:  
+                match = next((c for c in sb if c.get("session_id") == active_sid), None)  
+                if match and match.get("system_message"):  
+                    sys_msg = match.get("system_message")  
+  
+            fam = compute_first_assistant_title(merged_msgs) or ""  
+            item = {  
+                'id': active_sid,  
+                'user_id': user_id,  
+                'user_name': user_name,  
+                'session_id': active_sid,  
+                'messages': merged_msgs,  
+                'system_message': sys_msg,  
+                'first_assistant_message': fam,  
+                'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat()  
+            }  
+            if container:  
+                container.upsert_item(item)  
+  
+            session["main_chat_messages"] = merged_msgs  
+            sb = session.get("sidebar_messages", [])  
+            updated = False  
+            if active_sid:  
+                for i, chat in enumerate(sb):  
+                    if chat.get("session_id") == active_sid:  
+                        sb[i]["messages"] = merged_msgs  
+                        sb[i]["first_assistant_message"] = compute_first_assistant_title(merged_msgs)  
+                        sb[i]["system_message"] = sys_msg  
+                        session["sidebar_messages"] = sb  
+                        updated = True  
+                        break  
+            if not updated:  
+                sb.insert(0, {  
+                    "session_id": active_sid,  
+                    "messages": merged_msgs,  
+                    "first_assistant_message": compute_first_assistant_title(merged_msgs),  
+                    "system_message": sys_msg  
+                })  
+                session["sidebar_messages"] = sb  
+            session.modified = True  
+        except Exception as e:  
+            print("persist_assistant_message 保存エラー:", e)  
+            traceback.print_exc()  
+  
 def save_chat_history():  
+    """  
+    主会話(main_chat_messages)ベースで Cosmos に保存。  
+    - アシスタント応答がある場合のみ保存  
+    - 既存履歴とマージして短縮上書きを防ぐ  
+    - system_message はサイドバーにあればそれを優先  
+    """  
     if not container:  
         return  
     with lock:  
         try:  
-            sidebar = session.get("sidebar_messages", [])  
-            idx = session.get("current_chat_index", 0)  
-            if idx < len(sidebar):  
-                current = sidebar[idx]  
-                user_id = get_authenticated_user()  
-                user_name = session.get("user_name", "anonymous")  
-                session_id = current.get("session_id")  
-                item = {  
-                    'id': session_id,  
-                    'user_id': user_id,  
-                    'user_name': user_name,  
-                    'session_id': session_id,  
-                    'messages': current.get("messages", []),  
-                    'system_message': current.get(  
-                        "system_message", session.get("default_system_message", "あなたは親切なAIアシスタントです…")  
-                    ),  
-                    'first_assistant_message': current.get("first_assistant_message", ""),  
-                    'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat()  
-                }  
-                container.upsert_item(item)  
+            active_sid = session.get("current_session_id")  
+            msgs = session.get("main_chat_messages", []) or []  
+            if not active_sid or not msgs:  
+                return  
+  
+            user_id = get_authenticated_user()  
+            existing = []  
+            try:  
+                existing_item = container.read_item(item=active_sid, partition_key=user_id)  
+                existing = existing_item.get("messages", []) or []  
+            except Exception:  
+                pass  
+            msgs = merge_messages(existing, msgs)  
+  
+            if not compute_has_assistant(msgs):  
+                return  
+  
+            system_message = session.get("default_system_message", "あなたは親切なAIアシスタントです…")  
+            sb = session.get("sidebar_messages", [])  
+            if active_sid and sb:  
+                match = next((c for c in sb if c.get("session_id") == active_sid), None)  
+                if match and match.get("system_message"):  
+                    system_message = match.get("system_message")  
+  
+            fam = compute_first_assistant_title(msgs) or ""  
+            user_name = session.get("user_name", "anonymous")  
+            item = {  
+                'id': active_sid,  
+                'user_id': user_id,  
+                'user_name': user_name,  
+                'session_id': active_sid,  
+                'messages': msgs,  
+                'system_message': system_message,  
+                'first_assistant_message': fam,  
+                'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat()  
+            }  
+            container.upsert_item(item)  
+  
+            session["main_chat_messages"] = msgs  
+            sb = session.get("sidebar_messages", [])  
+            updated = False  
+            for i, chat in enumerate(sb):  
+                if chat.get("session_id") == active_sid:  
+                    sb[i]["messages"] = msgs  
+                    sb[i]["first_assistant_message"] = fam  
+                    sb[i]["system_message"] = system_message  
+                    session["sidebar_messages"] = sb  
+                    updated = True  
+                    break  
+            if not updated:  
+                sb.insert(0, {  
+                    "session_id": active_sid,  
+                    "messages": msgs,  
+                    "first_assistant_message": fam,  
+                    "system_message": system_message  
+                })  
+                session["sidebar_messages"] = sb  
+            session.modified = True  
         except Exception as e:  
             print("チャット履歴保存エラー:", e)  
             traceback.print_exc()  
@@ -451,13 +685,17 @@ def load_chat_history():
             items = container.query_items(query=query, parameters=parameters, enable_cross_partition_query=True)  
             for item in items:  
                 if 'session_id' in item:  
+                    msgs = item.get("messages", []) or []  
+                    if not compute_has_assistant(msgs):  
+                        continue  
+                    fam = item.get("first_assistant_message") or compute_first_assistant_title(msgs) or ""  
                     chat = {  
                         "session_id": item['session_id'],  
-                        "messages": item.get("messages", []),  
+                        "messages": msgs,  
                         "system_message": item.get(  
                             "system_message", session.get('default_system_message', "あなたは親切なAIアシスタントです…")  
                         ),  
-                        "first_assistant_message": item.get("first_assistant_message", "")  
+                        "first_assistant_message": fam  
                     }  
                     sidebar_messages.append(chat)  
         except Exception as e:  
@@ -492,7 +730,7 @@ def load_system_prompts():
     if not container:  
         return []  
     with lock:  
-        user_id = get_authenticated_user()  
+        get_authenticated_user()  
         prompts = []  
         try:  
             query = """  
@@ -501,7 +739,7 @@ def load_system_prompts():
             WHERE c.user_id = @user_id AND c.doc_type = 'system_prompt'  
             ORDER BY c.timestamp DESC  
             """  
-            parameters = [{"name": "@user_id", "value": user_id}]  
+            parameters = [{"name": "@user_id", "value": session["user_id"]}]  
             items = container.query_items(query=query, parameters=parameters, enable_cross_partition_query=True)  
             for it in items:  
                 prompts.append({  
@@ -529,7 +767,14 @@ def delete_system_prompt(prompt_id: str):
             return False  
   
 def start_new_chat():  
-    # 画像削除  
+    """  
+    新規チャット開始:  
+    - 画像/PDFをクリーンアップ  
+    - 新しい session_id を発行  
+    - main_chat_messages は空にする  
+    - サイドバー（sidebar_messages）は挿入しない（空セッション非表示）  
+    - current_chat_index は変更しない（上書き防止）  
+    """  
     image_filenames = session.get("image_filenames", [])  
     for img_name in image_filenames:  
         if image_container_client:  
@@ -539,7 +784,6 @@ def start_new_chat():
                 print("画像削除エラー:", e)  
     session["image_filenames"] = []  
   
-    # PDF削除  
     file_filenames = session.get("file_filenames", [])  
     for file_name in file_filenames:  
         if file_container_client:  
@@ -550,17 +794,9 @@ def start_new_chat():
     session["file_filenames"] = []  
   
     new_session_id = str(uuid.uuid4())  
-    new_chat = {  
-        "session_id": new_session_id,  
-        "messages": [],  
-        "first_assistant_message": "",  
-        "system_message": session.get('default_system_message', "あなたは親切なAIアシスタントです…"),  
-    }  
-    sidebar = session.get("sidebar_messages", [])  
-    sidebar.insert(0, new_chat)  
-    session["sidebar_messages"] = sidebar  
-    session["current_chat_index"] = 0  
+    session["current_session_id"] = new_session_id  
     session["main_chat_messages"] = []  
+    session.modified = True  
   
 # ------------------------------- Azure Cognitive Search -------------------------------  
 def get_search_client(index_name):  
@@ -715,10 +951,10 @@ def rrf_fuse_ranked_lists(lists_of_results, topNDocuments):
         fused_results.append(r)  
     return fused_results  
   
-# ------------------------------- フォールバック: HyDE / PRF（Responses API） -------------------------------  
+# ------------------------------- HyDE / PRF -------------------------------  
 def hyde_paragraph(user_input: str) -> str:  
     sys_msg = "あなたは検索のための仮想文書(HyDE)を作成します。事実の付け足しは避け、中立で。"  
-    p = f"""以下の質問に関して、中立で百科事典調の根拠段落を日本語で5-7文で作成してください。事実断定は避け、関連する用語を豊富に含めてください。これは検索用の仮想文書であり回答ではありません。  質問: {user_input}"""  
+    p = f"""以下の質問に関して、中立で百科事典調の根拠段落を日本語で5-7文で作成してください。事実断定は避け、関連する用語を豊富に含めてください。これは検索用の仮想文書であり回答ではありません。質問: {user_input}"""  
     input_items = [  
         {"role": "system", "content": [{"type": "input_text", "text": sys_msg}]},  
         {"role": "user", "content": [{"type": "input_text", "text": p}]},  
@@ -728,13 +964,13 @@ def hyde_paragraph(user_input: str) -> str:
         input=input_items,  
         temperature=0.2,  
         max_output_tokens=512,  
-        store=False  # サーバー側に履歴を保存しない  
+        store=False  
     )  
     return (extract_output_text(resp) or "").strip()  
   
 def refine_query_with_prf(initial_query: str, titles: list) -> str:  
     t = "\n".join(f"- {x}" for x in (titles or [])[:8])  
-    prompt = f"""初回検索の上位文書のタイトル一覧です。これを参考に、より適合度の高い検索クエリを日本語で1本だけ生成。不要語は削除し、重要語は維持。出力はクエリ文字列のみ。  タイトル:  {t}    初回クエリ: {initial_query}"""  
+    prompt = f"""初回検索の上位文書のタイトル一覧です。これを参考に、より適合度の高い検索クエリを日本語で1本だけ生成。不要語は削除し、重要語は維持。出力はクエリ文字列のみ。タイトル:{t}  初回クエリ: {initial_query}"""  
     input_items = [  
         {"role": "system", "content": [{"type": "input_text", "text": "あなたは検索クエリの改良を行うプロフェッショナルです。"}]},  
         {"role": "user", "content": [{"type": "input_text", "text": prompt}]},  
@@ -744,14 +980,95 @@ def refine_query_with_prf(initial_query: str, titles: list) -> str:
         input=input_items,  
         temperature=0,  
         max_output_tokens=256,  
-        store=False  # サーバー側に履歴を保存しない  
+        store=False  
     )  
     return (extract_output_text(resp) or "").strip().strip('「」\' ')  
   
 def unique_parents(results):  
     return len({(r.get("parent_id") or r.get("filepath") or r.get("title")) for r in (results or [])})  
   
-# ------------------------------- Responses API 入力を構築（system→history→直近userにコンテキスト追記） -------------------------------  
+# ------------------------------- RAGAS -------------------------------  
+RAGAS_LLM_WRAPPER = None  
+RAGAS_EMB_WRAPPER = None  
+  
+def init_ragas_clients():  
+    global RAGAS_LLM_WRAPPER, RAGAS_EMB_WRAPPER  
+    if RAGAS_LLM_WRAPPER and RAGAS_EMB_WRAPPER:  
+        return RAGAS_LLM_WRAPPER, RAGAS_EMB_WRAPPER  
+    if not RAGAS_AVAILABLE:  
+        return None, None  
+  
+    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")  
+    api_key = os.getenv("AZURE_OPENAI_KEY")  
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")  
+  
+    judge_deploy = os.getenv("AZURE_OPENAI_RAGAS_JUDGE_DEPLOYMENT") or os.getenv("AZURE_OPENAI_RESPONSES_MODEL", "gpt-4o")  
+    embed_deploy = os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT", EMBEDDING_MODEL)  
+  
+    llm = ChatOpenAI(  
+        azure_endpoint=azure_endpoint,  
+        api_key=api_key,  
+        azure_deployment=judge_deploy,  
+        api_version=api_version,  
+        temperature=0  
+    )  
+    emb = OpenAIEmbeddings(  
+        azure_endpoint=embed_endpoint or azure_endpoint,  
+        api_key=api_key,  
+        azure_deployment=embed_deploy,  
+        api_version=os.getenv("AZURE_OPENAI_EMBED_API_VERSION", "2024-06-01")  
+    )  
+  
+    RAGAS_LLM_WRAPPER = LangchainLLMWrapper(llm)  
+    RAGAS_EMB_WRAPPER = LangchainEmbeddingsWrapper(emb)  
+    return RAGAS_LLM_WRAPPER, RAGAS_EMB_WRAPPER  
+  
+def compute_ragas_metrics(question: str, contexts: list, answer: str) -> dict:  
+    try:  
+        if not ENABLE_RAGAS or not RAGAS_AVAILABLE:  
+            return {}  
+        if not answer or not question:  
+            return {}  
+        llm, emb = init_ragas_clients()  
+        if not llm or not emb:  
+            return {}  
+  
+        ctxs = [c for c in (contexts or []) if isinstance(c, str) and c.strip()]  
+        ds = Dataset.from_dict({  
+            "question": [question],  
+            "answer": [answer],  
+            "contexts": [ctxs]  
+        })  
+  
+        metrics = [answer_relevancy]  
+        if ctxs:  
+            metrics += [faithfulness, context_precision, context_relevancy]  
+  
+        result = evaluate(ds, metrics=metrics, llm=llm, embeddings=emb)  
+        scores = {}  
+        try:  
+            df = result.to_pandas()  
+            row = df.iloc[0]  
+            for m in metrics:  
+                name = getattr(m, "name", None) or m.__class__.__name__  
+                if name in df.columns and isinstance(row[name], (int, float)):  
+                    scores[name] = round(float(row[name]), 4)  
+        except Exception:  
+            if hasattr(result, "scores"):  
+                for m in metrics:  
+                    name = getattr(m, "name", None) or m.__class__.__name__  
+                    val = result.scores.get(name)  
+                    if isinstance(val, list):  
+                        val = val[0]  
+                    if isinstance(val, (int, float)):  
+                        scores[name] = round(float(val), 4)  
+        return scores  
+    except Exception as e:  
+        print("RAGAS evaluate error:", e)  
+        traceback.print_exc()  
+        return {}  
+  
+# ------------------------------- Responses 入力構築 -------------------------------  
 def build_responses_input_with_history(  
     all_messages,  
     system_message,  
@@ -760,27 +1077,14 @@ def build_responses_input_with_history(
     wrap_context_with_markers=True,  
     context_title="参考コンテキスト（RAG）",  
 ):  
-    """  
-    入力構築ルール:  
-    - system を最初に  
-    - 履歴（user/assistant）を時系列でそのまま詰める（改変しない）  
-    - context_text があれば、末尾に『コンテキスト専用の user メッセージ』は作らず、  
-      「直近の実ユーザー発話」に input_text として追記する（承認/指示を直近として維持）  
-    - BEGIN_CONTEXT/END_CONTEXT で囲む（任意）  
-    - 添付（input_image/input_file）はこの『直近の実ユーザー発話』に append する  
-    戻り値:  
-    (input_items, target_user_index)  # target_user_index は『直近の実ユーザー発話』。存在しない場合は None。  
-    """  
     input_items = []  
   
-    # 1) system  
     if system_message:  
         input_items.append({  
             "role": "system",  
             "content": [{"type": "input_text", "text": system_message}]  
         })  
   
-    # 2) 履歴（時系列のまま）  
     if max_history_to_send is None:  
         max_history_to_send = MAX_HISTORY_TO_SEND  
     try:  
@@ -790,7 +1094,6 @@ def build_responses_input_with_history(
     max_history_to_send = max(1, min(50, max_history_to_send))  
   
     hist = (all_messages or [])[-max_history_to_send:]  
-  
     for m in hist:  
         role = m.get("role", "user")  
         if role not in ["user", "assistant"]:  
@@ -810,14 +1113,12 @@ def build_responses_input_with_history(
             "content": [{"type": ctype, "text": text}]  
         })  
   
-    # 3) 直近の『実ユーザー発話』を特定  
     last_user_index = None  
     for i in range(len(input_items) - 1, -1, -1):  
         if input_items[i].get("role") == "user":  
             last_user_index = i  
             break  
   
-    # 4) コンテキスト追記（直近のユーザー発話に append。なければレアケースとして新規userを作成）  
     target_user_index = last_user_index  
     if context_text:  
         ctx = (  
@@ -831,7 +1132,6 @@ def build_responses_input_with_history(
             })  
             target_user_index = last_user_index  
         else:  
-            # 直近ユーザー発話が存在しない場合のみ、新規userとして追加（稀ケース）  
             input_items.append({  
                 "role": "user",  
                 "content": [{"type": "input_text", "text": ctx}]  
@@ -840,11 +1140,10 @@ def build_responses_input_with_history(
   
     return input_items, target_user_index  
   
-# ------------------------------- セッション内アップロードの一括削除 + エンドポイント -------------------------------  
+# ------------------------------- セッション内ファイル一括削除 -------------------------------  
 def _delete_uploaded_files_for_session():  
     deleted = {"images": [], "files": []}  
     try:  
-        # 画像  
         image_filenames = list(session.get("image_filenames", []))  
         if image_container_client:  
             for name in image_filenames:  
@@ -855,7 +1154,6 @@ def _delete_uploaded_files_for_session():
                         deleted["images"].append(name)  
                 except Exception as e:  
                     print("画像削除失敗:", name, e)  
-        # PDF  
         file_filenames = list(session.get("file_filenames", []))  
         if file_container_client:  
             for name in file_filenames:  
@@ -866,9 +1164,7 @@ def _delete_uploaded_files_for_session():
                         deleted["files"].append(name)  
                 except Exception as e:  
                     print("PDF削除失敗:", name, e)  
-        session["image_filenames"] = []  
-        session["file_filenames"] = []  
-        session.modified = True  
+        # ここではセッションを書き換えない（競合・上書き回避）  
     except Exception as e:  
         print("セッションファイル一括削除エラー:", e)  
     return deleted  
@@ -885,30 +1181,23 @@ def update_settings():
     data = request.get_json(silent=True) or {}  
     changed = {}  
   
-    # モデル  
     if "selected_model" in data:  
         selected = (data.get("selected_model") or "").strip()  
         allowed_models = {"gpt-4o", "gpt-4.1", "o3", "o4-mini", "gpt-5"}  
         if selected in allowed_models:  
             session["selected_model"] = selected  
             changed["selected_model"] = selected  
-  
-    # reasoning_effort（対応モデル時のみ）  
     if "reasoning_effort" in data:  
         effort = (data.get("reasoning_effort") or "").strip().lower()  
         allowed_efforts = {"low", "medium", "high"}  
         if session.get("selected_model") in REASONING_ENABLED_MODELS and effort in allowed_efforts:  
             session["reasoning_effort"] = effort  
             changed["reasoning_effort"] = effort  
-  
-    # 検索インデックス  
     if "selected_search_index" in data:  
         sel_index = (data.get("selected_search_index") or "").strip()  
         if sel_index in INDEX_VALUES:  
             session["selected_search_index"] = sel_index  
             changed["selected_search_index"] = sel_index  
-  
-    # ドキュメント数  
     if "doc_count" in data:  
         try:  
             val = int(data.get("doc_count"))  
@@ -916,8 +1205,6 @@ def update_settings():
             val = DEFAULT_DOC_COUNT  
         session["doc_count"] = max(1, min(300, val))  
         changed["doc_count"] = session["doc_count"]  
-  
-    # 履歴数  
     if "history_to_send" in data:  
         try:  
             val = int(data.get("history_to_send"))  
@@ -925,25 +1212,23 @@ def update_settings():
             val = MAX_HISTORY_TO_SEND  
         session["history_to_send"] = max(1, min(50, val))  
         changed["history_to_send"] = session["history_to_send"]  
-  
-    # システムメッセージ  
     if "default_system_message" in data:  
         sys_msg = (data.get("default_system_message") or "").strip()  
         session["default_system_message"] = sys_msg  
-        idx = session.get("current_chat_index", 0)  
-        sidebar = session.get("sidebar_messages", [])  
-        if sidebar and idx < len(sidebar):  
-            sidebar[idx]["system_message"] = sys_msg  
-            session["sidebar_messages"] = sidebar  
+        active_sid = session.get("current_session_id")  
+        sb = session.get("sidebar_messages", [])  
+        if active_sid:  
+            for i, chat in enumerate(sb):  
+                if chat.get("session_id") == active_sid:  
+                    sb[i]["system_message"] = sys_msg  
+                    session["sidebar_messages"] = sb  
+                    break  
         changed["default_system_message"] = sys_msg  
-  
-    # RAG ON/OFF  
     if "rag_enabled" in data:  
         raw = data.get("rag_enabled")  
         val = bool(raw)  
         session["rag_enabled"] = val  
         changed["rag_enabled"] = val  
-  
     session.modified = True  
     return jsonify({"ok": True, "changed": changed})  
   
@@ -969,14 +1254,23 @@ def index():
             "「こういうことですか？」と内容を確認してください。質問が明確な場合は、"  
             "簡潔かつ正確に答えてください。"  
         )  
-    if "sidebar_messages" not in session:  
-        session["sidebar_messages"] = load_chat_history() or []  
-    if "current_chat_index" not in session:  
+  
+    # 毎回 Cosmos から履歴を再同期（空セッション非表示）  
+    session["sidebar_messages"] = load_chat_history() or []  
+  
+    # アプリ起動時（このセッションの初回表示）は必ず新規チャットを開始  
+    if not session.get("initial_chat_opened"):  
         start_new_chat()  
+        session["initial_chat_opened"] = True  
+  
+    # main_chat_messages が未設定なら空で初期化（初回は必ず空の新規チャット）  
     if "main_chat_messages" not in session:  
-        idx0 = session.get("current_chat_index", 0)  
-        sb = session.get("sidebar_messages", [])  
-        session["main_chat_messages"] = sb[idx0].get("messages", []) if (sb and idx0 < len(sb)) else []  
+        session["main_chat_messages"] = []  
+  
+    # current_session_id の初期補完（万一欠落時）  
+    if "current_session_id" not in session or not session.get("current_session_id"):  
+        start_new_chat()  
+  
     if "image_filenames" not in session:  
         session["image_filenames"] = []  
     if "file_filenames" not in session:  
@@ -986,36 +1280,102 @@ def index():
     if "show_all_history" not in session:  
         session["show_all_history"] = False  
     if "upload_prefix" not in session:  
-        session["upload_prefix"] = str(uuid.uuid4())  # セッション専用プレフィックス  
+        session["upload_prefix"] = str(uuid.uuid4())  
     if "rag_enabled" not in session:  
         session["rag_enabled"] = True  
     session.modified = True  
   
-    # POST ハンドラ（既存のフォーム動作は維持）  
+    # --- POST ハンドラ ---  
     if request.method == 'POST':  
+        # 新しいチャット  
+        if request.form.get('new_chat'):  
+            start_new_chat()  
+            session.modified = True  
+            return redirect(url_for('index'))  
+  
+        # 既存チャットを選択  
+        if 'select_chat' in request.form:  
+            sid = request.form.get('select_chat')  
+            sb = session.get("sidebar_messages", [])  
+            for i, chat in enumerate(sb):  
+                if chat.get("session_id") == sid:  
+                    session["current_chat_index"] = i  
+                    session["current_session_id"] = sid  
+                    msgs = ensure_messages_from_cosmos(sid) or chat.get("messages", [])  
+                    session["main_chat_messages"] = msgs  
+                    session.modified = True  
+                    break  
+            return redirect(url_for('index'))  
+  
+        # 履歴の表示件数トグル  
+        if 'toggle_history' in request.form:  
+            session["show_all_history"] = not bool(session.get("show_all_history", False))  
+            session.modified = True  
+            return redirect(url_for('index'))  
+  
+        # system_message の直接更新（session_id ベース）  
+        if 'set_system_message' in request.form:  
+            sys_msg = (request.form.get('system_message') or '').strip()  
+            session["default_system_message"] = sys_msg  
+            active_sid = session.get("current_session_id")  
+            sb = session.get("sidebar_messages", [])  
+            if active_sid:  
+                for i, chat in enumerate(sb):  
+                    if chat.get("session_id") == active_sid:  
+                        sb[i]["system_message"] = sys_msg  
+                        session["sidebar_messages"] = sb  
+                        break  
+            session.modified = True  
+            return redirect(url_for('index'))  
+  
+        # 登録済みプロンプトを適用（session_id ベース）  
+        if 'apply_system_prompt' in request.form:  
+            prompt_id = request.form.get('select_prompt_id')  
+            saved = session.get("saved_prompts", [])  
+            match = next((p for p in saved if p.get("id") == prompt_id), None)  
+            if match:  
+                session["default_system_message"] = match.get("content", "")  
+                active_sid = session.get("current_session_id")  
+                sb = session.get("sidebar_messages", [])  
+                if active_sid:  
+                    for i, chat in enumerate(sb):  
+                        if chat.get("session_id") == active_sid:  
+                            sb[i]["system_message"] = session["default_system_message"]  
+                            session["sidebar_messages"] = sb  
+                            break  
+            session.modified = True  
+            return redirect(url_for('index'))  
+  
+        # 新しい指示を保存  
+        if 'add_system_prompt' in request.form:  
+            title = (request.form.get('prompt_title') or '').strip()  
+            content = (request.form.get('prompt_content') or '').strip()  
+            if title and content:  
+                pid = save_system_prompt_item(title, content)  
+                if pid:  
+                    session["saved_prompts"] = load_system_prompts()  
+            session.modified = True  
+            return redirect(url_for('index'))  
+  
+        # （フォーム直送のためのフォールバック設定。AJAXが効いていない環境用）  
         if 'set_model' in request.form:  
-            selected = (request.form.get("model") or "").strip()  
+            selected = (request.form.get('model') or '').strip()  
             allowed_models = {"gpt-4o", "gpt-4.1", "o3", "o4-mini", "gpt-5"}  
             if selected in allowed_models:  
                 session["selected_model"] = selected  
-            effort = (request.form.get("reasoning_effort") or "").strip().lower()  
-            allowed_efforts = {"low", "medium", "high"}  
-            if session.get("selected_model") in REASONING_ENABLED_MODELS and effort in allowed_efforts:  
-                session["reasoning_effort"] = effort  
             session.modified = True  
             return redirect(url_for('index'))  
   
         if 'set_index' in request.form:  
-            sel_index = (request.form.get("search_index") or "").strip()  
+            sel_index = (request.form.get('search_index') or '').strip()  
             if sel_index in INDEX_VALUES:  
                 session["selected_search_index"] = sel_index  
             session.modified = True  
             return redirect(url_for('index'))  
   
         if 'set_doc_count' in request.form:  
-            raw = (request.form.get("doc_count") or "").strip()  
             try:  
-                val = int(raw)  
+                val = int(request.form.get('doc_count') or DEFAULT_DOC_COUNT)  
             except Exception:  
                 val = DEFAULT_DOC_COUNT  
             session["doc_count"] = max(1, min(300, val))  
@@ -1023,156 +1383,90 @@ def index():
             return redirect(url_for('index'))  
   
         if 'set_history_to_send' in request.form:  
-            raw = (request.form.get("history_to_send") or "").strip()  
             try:  
-                val = int(raw)  
+                val = int(request.form.get('history_to_send') or MAX_HISTORY_TO_SEND)  
             except Exception:  
                 val = MAX_HISTORY_TO_SEND  
             session["history_to_send"] = max(1, min(50, val))  
             session.modified = True  
             return redirect(url_for('index'))  
   
-        if 'set_system_message' in request.form:  
-            sys_msg = (request.form.get("system_message") or "").strip()  
-            session["default_system_message"] = sys_msg  
-            idx = session.get("current_chat_index", 0)  
-            sidebar = session.get("sidebar_messages", [])  
-            if sidebar and idx < len(sidebar):  
-                sidebar[idx]["system_message"] = sys_msg  
-                session["sidebar_messages"] = sidebar  
-            session.modified = True  
-            return redirect(url_for('index'))  
-  
-        if 'add_system_prompt' in request.form:  
-            title = (request.form.get("prompt_title") or "").strip()  
-            content = (request.form.get("prompt_content") or "").strip()  
-            if title and content:  
-                save_system_prompt_item(title, content)  
-                session["saved_prompts"] = load_system_prompts()  
-                flash("指示を登録しました。", "info")  
-            else:  
-                flash("タイトルと指示内容を入力してください。", "error")  
-            session.modified = True  
-            return redirect(url_for('index'))  
-  
-        if 'apply_system_prompt' in request.form:  
-            pid = request.form.get("select_prompt_id", "")  
-            prompts = session.get("saved_prompts", [])  
-            selected = next((p for p in prompts if p.get("id") == pid), None)  
-            if selected:  
-                sys_msg = selected.get("content", "")  
-                session["default_system_message"] = sys_msg  
-                idx = session.get("current_chat_index", 0)  
-                sidebar = session.get("sidebar_messages", [])  
-                if sidebar and idx < len(sidebar):  
-                    sidebar[idx]["system_message"] = sys_msg  
-                    session["sidebar_messages"] = sidebar  
-                flash(f"『{selected.get('title','無題')}』を適用しました。", "info")  
-            else:  
-                flash("指示が見つかりません。", "error")  
-            session.modified = True  
-            return redirect(url_for('index'))  
-  
-        if 'delete_system_prompt' in request.form:  
-            pid = request.form.get("delete_system_prompt", "")  
-            if pid:  
-                delete_system_prompt(pid)  
-                session["saved_prompts"] = load_system_prompts()  
-                flash("指示を削除しました。", "info")  
-            session.modified = True  
-            return redirect(url_for('index'))  
-  
-        if 'new_chat' in request.form:  
-            start_new_chat()  
-            session["show_all_history"] = False  
-            session.modified = True  
-            return redirect(url_for('index'))  
-  
-        if 'select_chat' in request.form:  
-            selected_session = request.form.get("select_chat")  
-            sidebar = session.get("sidebar_messages", [])  
-            for idx, chat in enumerate(sidebar):  
-                if chat.get("session_id") == selected_session:  
-                    session["current_chat_index"] = idx  
-                    session["main_chat_messages"] = chat.get("messages", [])  
-                    session["default_system_message"] = chat.get("system_message", session.get("default_system_message"))  
-                    break  
-            session.modified = True  
-            return redirect(url_for('index'))  
-  
-        if 'toggle_history' in request.form:  
-            session["show_all_history"] = not session.get("show_all_history", False)  
-            session.modified = True  
-            return redirect(url_for('index'))  
-  
+        # 画像/PDFアップロード  
         if 'upload_files' in request.form:  
-            if 'files' in request.files:  
-                files = request.files.getlist("files")  
-                image_filenames = session.get("image_filenames", [])  
-                file_filenames = session.get("file_filenames", [])  
-                upload_prefix = session.get("upload_prefix") or str(uuid.uuid4())  
-                session["upload_prefix"] = upload_prefix  
-                for f in files:  
-                    if f and f.filename != '':  
-                        original = secure_filename(f.filename)  
-                        ext = original.rsplit('.', 1)[-1].lower() if '.' in original else ''  
-                        blob_name = f"{upload_prefix}/{uuid.uuid4()}__{original}"  
-                        if ext in ['png', 'jpeg', 'jpg', 'gif']:  
-                            if image_container_client:  
-                                blob_client = image_container_client.get_blob_client(blob_name)  
-                                try:  
-                                    f.stream.seek(0)  
-                                    blob_client.upload_blob(f.stream, overwrite=True)  
-                                    if blob_name not in image_filenames:  
-                                        image_filenames.append(blob_name)  
-                                except Exception as e:  
-                                    print("画像アップロードエラー:", e)  
-                                    flash("画像アップロードに失敗しました。", "error")  
-                        elif ext == 'pdf':  
-                            if file_container_client:  
-                                blob_client = file_container_client.get_blob_client(blob_name)  
-                                try:  
-                                    f.stream.seek(0)  
-                                    blob_client.upload_blob(f.stream, overwrite=True)  
-                                    if blob_name not in file_filenames:  
-                                        file_filenames.append(blob_name)  
-                                except Exception as e:  
-                                    print("PDFアップロードエラー:", e)  
-                                    flash("PDFアップロードに失敗しました。", "error")  
-                session["image_filenames"] = image_filenames  
-                session["file_filenames"] = file_filenames  
-                session.modified = True  
+            if not blob_service_client or not file_container_client or not image_container_client:  
+                flash("ストレージ未設定です。環境変数 AZURE_STORAGE_CONNECTION_STRING を設定してください。", "error")  
+                return redirect(url_for('index'))  
+  
+            files_list = request.files.getlist('files')  
+            if not files_list:  
+                flash("ファイルが選択されていません。", "warning")  
+                return redirect(url_for('index'))  
+  
+            upload_prefix = session.get("upload_prefix", str(uuid.uuid4()))  
+            uploaded_images = session.get("image_filenames", [])  
+            uploaded_pdfs = session.get("file_filenames", [])  
+  
+            for f in files_list:  
+                if not f or not f.filename:  
+                    continue  
+                fname = secure_filename(f.filename)  
+                ext = os.path.splitext(fname)[1].lower()  
+                blobname = f"{upload_prefix}/{uuid.uuid4().hex}__{fname}"  
+  
+                try:  
+                    if ext == '.pdf':  
+                        bc = file_container_client.get_blob_client(blobname)  
+                        bc.upload_blob(f.stream, overwrite=True, content_type="application/pdf")  
+                        uploaded_pdfs.append(blobname)  
+                        print("Uploaded PDF:", blobname)  
+                    elif ext in ['.png', '.jpg', '.jpeg', '.gif']:  
+                        bc = image_container_client.get_blob_client(blobname)  
+                        mime = "image/png" if ext == '.png' else ("image/gif" if ext == '.gif' else "image/jpeg")  
+                        bc.upload_blob(f.stream, overwrite=True, content_type=mime)  
+                        uploaded_images.append(blobname)  
+                        print("Uploaded image:", blobname)  
+                    else:  
+                        flash(f"未対応の拡張子: {fname}", "warning")  
+                except Exception as e:  
+                    print("Upload error:", e)  
+                    traceback.print_exc()  
+                    flash(f"アップロードに失敗: {fname} ({e})", "error")  
+  
+            session["image_filenames"] = uploaded_images  
+            session["file_filenames"] = uploaded_pdfs  
+            session.modified = True  
             return redirect(url_for('index'))  
   
+        # 画像削除  
         if 'delete_image' in request.form:  
-            delete_blobname = request.form.get("delete_image")  
-            image_filenames = [n for n in session.get("image_filenames", []) if n != delete_blobname]  
-            if image_container_client and delete_blobname:  
+            name = request.form.get('delete_image')  
+            if image_container_client and name:  
                 try:  
-                    bc = image_container_client.get_blob_client(delete_blobname)  
-                    if bc.exists():  
-                        bc.delete_blob(delete_snapshots="include")  
+                    image_container_client.get_blob_client(name).delete_blob(delete_snapshots="include")  
                 except Exception as e:  
-                    print("画像削除エラー(無視可):", e)  
-            session["image_filenames"] = image_filenames  
+                    print("画像削除エラー:", e)  
+                    flash(f"画像削除失敗: {e}", "error")  
+            session["image_filenames"] = [x for x in session.get("image_filenames", []) if x != name]  
             session.modified = True  
             return redirect(url_for('index'))  
   
+        # PDF削除  
         if 'delete_file' in request.form:  
-            delete_blobname = request.form.get("delete_file")  
-            file_filenames = [n for n in session.get("file_filenames", []) if n != delete_blobname]  
-            if file_container_client and delete_blobname:  
+            name = request.form.get('delete_file')  
+            if file_container_client and name:  
                 try:  
-                    bc = file_container_client.get_blob_client(delete_blobname)  
-                    if bc.exists():  
-                        bc.delete_blob(delete_snapshots="include")  
+                    file_container_client.get_blob_client(name).delete_blob(delete_snapshots="include")  
                 except Exception as e:  
-                    print("ファイル削除エラー(無視可):", e)  
-            session["file_filenames"] = file_filenames  
+                    print("PDF削除エラー:", e)  
+                    flash(f"PDF削除失敗: {e}", "error")  
+            session["file_filenames"] = [x for x in session.get("file_filenames", []) if x != name]  
             session.modified = True  
             return redirect(url_for('index'))  
   
-    # 描画データ作成（SAS URLを発行）  
+        # その他POST  
+        return redirect(url_for('index'))  
+  
+    # --- GET: 描画 ---  
     images = []  
     if image_container_client:  
         for blobname in session.get("image_filenames", []):  
@@ -1210,7 +1504,7 @@ def index():
         saved_prompts=saved_prompts  
     )  
   
-# ------------------------------- 長文を事前登録する準備エンドポイント -------------------------------  
+# ------------------------------- 準備/送信/SSE -------------------------------  
 @app.route('/prepare_stream', methods=['POST'])  
 def prepare_stream():  
     data = request.get_json(silent=True) or {}  
@@ -1224,19 +1518,37 @@ def prepare_stream():
     session.modified = True  
     return jsonify({"message_id": mid})  
   
-# ------------------------------- メッセージ送信（非SSE） -------------------------------  
 @app.route('/send_message', methods=['POST'])  
 def send_message():  
     data = request.get_json()  
     prompt = (data.get('prompt') or '').strip()  
     if not prompt:  
         return (  
-            json.dumps({'response': '', 'search_files': [], 'reasoning_summary': '', 'rewritten_queries': []}),  
+            json.dumps({'response': '', 'search_files': [], 'reasoning_summary': '', 'rewritten_queries': [], 'ragas': {}, 'session_id': session.get("current_session_id", "")}),  
             400,  
             {'Content-Type': 'application/json'}  
         )  
   
+    # 開始時点のアクティブ会話IDを安定取得  
+    active_sid = session.get("current_session_id")  
+    if not active_sid:  
+        sb = session.get("sidebar_messages", [])  
+        if sb:  
+            idx = session.get("current_chat_index", 0)  
+            active_sid = sb[idx].get("session_id")  
+            session["current_session_id"] = active_sid  
+        else:  
+            start_new_chat()  
+            active_sid = session.get("current_session_id")  
+  
+    # Cosmos から復元（セッションが空の場合）  
     messages = session.get("main_chat_messages", [])  
+    if not messages and container and active_sid:  
+        messages = ensure_messages_from_cosmos(active_sid)  
+        session["main_chat_messages"] = messages  
+        session.modified = True  
+  
+    # ユーザメッセージを追加  
     messages.append({"role": "user", "content": prompt, "type": "text"})  
     session["main_chat_messages"] = messages  
     session.modified = True  
@@ -1247,27 +1559,24 @@ def send_message():
         doc_count = max(1, min(300, int(session.get("doc_count", DEFAULT_DOC_COUNT))))  
         rag_enabled = bool(session.get("rag_enabled", True))  
   
+        # system_message は current_session_id から優先取得  
         system_message = session.get("default_system_message", "")  
-        idx = session.get("current_chat_index", 0)  
-        sidebar = session.get("sidebar_messages", [])  
-        if sidebar and 0 <= idx < len(sidebar):  
-            system_message = sidebar[idx].get("system_message", system_message)  
+        sb_for_sys = session.get("sidebar_messages", [])  
+        if active_sid:  
+            match_chat = next((c for c in sb_for_sys if c.get("session_id") == active_sid), None)  
+            if match_chat:  
+                system_message = match_chat.get("system_message", system_message)  
+        else:  
+            idx = session.get("current_chat_index", 0)  
+            if sb_for_sys and 0 <= idx < len(sb_for_sys):  
+                system_message = sb_for_sys[idx].get("system_message", system_message)  
   
-        # RAG分岐  
         queries = []  
         search_files = []  
         context = ""  
   
-        def _to_text(m):  
-            if m.get("role") == "assistant":  
-                return m.get("text") or strip_html_tags(m.get("content", ""))  
-            return m.get("content", "")  
-  
         if rag_enabled:  
-            turns = max(1, min(MAX_REWRITE_TURNS, len(messages)))  
-            recent_texts = [_to_text(m) for m in messages[-turns:]]  
-            rq = rewrite_query(prompt, recent_texts)  
-            queries = [rq or prompt]  
+            queries = rewrite_queries_for_search_responses(messages, prompt, system_message)  
   
             strictness = 0.0  
             results_list = hybrid_search_multiqueries(queries, doc_count, selected_index, strictness)  
@@ -1290,7 +1599,6 @@ def send_message():
                 for r in results_list  
             ])[:50000]  
   
-            # 検索ファイル一覧を生成  
             for r in results_list:  
                 title = r.get('title', '不明')  
                 content = r.get('content', '')  
@@ -1312,16 +1620,14 @@ def send_message():
                             url = generate_sas_url(blob_client, blobname)  
                     except Exception as e:  
                         print("SAS/ダウンロードURL生成エラー:", e)  
-                search_files.append({'title': title, 'content': content, 'url': url})  
+                path_display = fp or (f"{container_name}/{blobname}" if (container_name and blobname) else (r.get('url') or ''))  
+                search_files.append({'title': title, 'content': content, 'url': url, 'filepath': path_display})  
         else:  
-            # RAG OFF: 検索もリライトも行わず、会話＋添付のみ  
             queries = []  
             search_files = []  
             context = ""  
   
         history_to_send = session.get("history_to_send", MAX_HISTORY_TO_SEND)  
-  
-        # Responses API 入力構築（system→history→直近userにコンテキスト追記）  
         input_items, target_user_index = build_responses_input_with_history(  
             all_messages=messages,  
             system_message=system_message,  
@@ -1330,7 +1636,6 @@ def send_message():
             wrap_context_with_markers=True  
         )  
   
-        # 添付は『直近の実ユーザー発話』へ（context_text が空ならフォールバックで最後の通常 user）  
         if target_user_index is None:  
             for i in range(len(input_items) - 1, -1, -1):  
                 if input_items[i].get("role") == "user":  
@@ -1338,7 +1643,6 @@ def send_message():
                     break  
   
         if target_user_index is not None:  
-            # 画像  
             image_filenames = session.get("image_filenames", [])  
             for img_blob in image_filenames:  
                 if not image_container_client:  
@@ -1358,7 +1662,6 @@ def send_message():
                     print("画像添付URL生成エラー:", e)  
                     traceback.print_exc()  
   
-            # PDF  
             file_filenames = session.get("file_filenames", [])  
             for pdf_blob in file_filenames:  
                 if not pdf_blob.lower().endswith('.pdf') or not file_container_client:  
@@ -1395,30 +1698,31 @@ def send_message():
             output_text or "",  
             extras=["tables", "fenced-code-blocks", "code-friendly", "break-on-newline", "cuddled-lists"]  
         ) or "<p>（応答テキストが空でした。もう一度お試しください）</p>"  
-  
         reasoning_summary = extract_reasoning_summary(response)  
   
-        messages.append({"role": "assistant", "content": assistant_html, "type": "html", "text": output_text})  
-        session["main_chat_messages"] = messages  
-        session.modified = True  
+        ragas_scores = {}  
+        try:  
+            contexts_for_eval = [sf.get("content", "") for sf in (search_files or []) if isinstance(sf.get("content"), str)]  
+            ragas_scores = compute_ragas_metrics(prompt, contexts_for_eval, output_text)  
+        except Exception as e:  
+            print("RAGAS compute error:", e)  
   
-        idx = session.get("current_chat_index", 0)  
-        sidebar = session.get("sidebar_messages", [])  
-        if idx < len(sidebar):  
-            sidebar[idx]["messages"] = messages  
-            if not sidebar[idx].get("first_assistant_message"):  
-                sidebar[idx]["first_assistant_message"] = output_text  
-            session["sidebar_messages"] = sidebar  
-            session.modified = True  
-  
-        save_chat_history()  
+        persist_assistant_message(  
+            active_sid=active_sid,  
+            assistant_html=assistant_html,  
+            full_text=output_text,  
+            ragas_scores=ragas_scores,  
+            system_message=system_message  
+        )  
   
         return (  
             json.dumps({  
                 'response': assistant_html,  
                 'search_files': search_files,  
                 'reasoning_summary': reasoning_summary,  
-                'rewritten_queries': queries  
+                'rewritten_queries': queries,  
+                'ragas': ragas_scores,  
+                'session_id': active_sid  
             }),  
             200,  
             {'Content-Type': 'application/json'}  
@@ -1432,17 +1736,17 @@ def send_message():
                 'response': f"エラーが発生しました: {e}",  
                 'search_files': [],  
                 'reasoning_summary': '',  
-                'rewritten_queries': []  
+                'rewritten_queries': [],  
+                'ragas': {},  
+                'session_id': active_sid  
             }),  
             500,  
             {'Content-Type': 'application/json'}  
         )  
   
-# ------------------------------- SSE ストリーミング ヘルパー -------------------------------  
 def _sse_event(event_name: str, data_obj) -> str:  
     return f"event: {event_name}\ndata: {json.dumps(data_obj, ensure_ascii=False)}\n\n"  
   
-# ------------------------------- SSE ストリーミング エンドポイント -------------------------------  
 @app.route('/stream_message', methods=['GET'])  
 def stream_message():  
     mid = (request.args.get('mid') or request.args.get('message_id') or '').strip()  
@@ -1457,7 +1761,25 @@ def stream_message():
     if not prompt:  
         return ("missing prompt", 400, {"Content-Type": "text/plain; charset=utf-8"})  
   
+    # 開始時点のアクティブ会話IDを安定取得  
+    active_sid = session.get("current_session_id")  
+    if not active_sid:  
+        sb = session.get("sidebar_messages", [])  
+        if sb:  
+            idx = session.get("current_chat_index", 0)  
+            active_sid = sb[idx].get("session_id")  
+            session["current_session_id"] = active_sid  
+        else:  
+            start_new_chat()  
+            active_sid = session.get("current_session_id")  
+  
+    # Cosmos から復元（セッションが空の場合）  
     messages = session.get("main_chat_messages", [])  
+    if not messages and container and active_sid:  
+        messages = ensure_messages_from_cosmos(active_sid)  
+        session["main_chat_messages"] = messages  
+        session.modified = True  
+  
     messages.append({"role": "user", "content": prompt, "type": "text"})  
     session["main_chat_messages"] = messages  
     session.modified = True  
@@ -1468,10 +1790,15 @@ def stream_message():
     history_to_send = session.get("history_to_send", MAX_HISTORY_TO_SEND)  
   
     system_message = session.get("default_system_message", "")  
-    idx = session.get("current_chat_index", 0)  
-    sidebar = session.get("sidebar_messages", [])  
-    if sidebar and 0 <= idx < len(sidebar):  
-        system_message = sidebar[idx].get("system_message", system_message)  
+    sb_for_sys = session.get("sidebar_messages", [])  
+    if active_sid:  
+        match_chat = next((c for c in sb_for_sys if c.get("session_id") == active_sid), None)  
+        if match_chat:  
+            system_message = match_chat.get("system_message", system_message)  
+    else:  
+        idx = session.get("current_chat_index", 0)  
+        if sb_for_sys and 0 <= idx < len(sb_for_sys):  
+            system_message = sb_for_sys[idx].get("system_message", system_message)  
   
     image_filenames = list(session.get("image_filenames", []))  
     file_filenames = list(session.get("file_filenames", []))  
@@ -1485,7 +1812,15 @@ def stream_message():
   
     q = queue.Queue(maxsize=100)  
     done_event = threading.Event()  
-    result_holder = {"full_text": "", "assistant_html": "", "reasoning_summary": "", "search_files": [], "error": None}  
+    result_holder = {  
+        "full_text": "",  
+        "assistant_html": "",  
+        "reasoning_summary": "",  
+        "search_files": [],  
+        "error": None,  
+        "ragas_scores": {},  
+        "persisted": False  
+    }  
   
     @copy_current_request_context  
     def producer():  
@@ -1495,15 +1830,7 @@ def stream_message():
             queries = []  
   
             if rag_enabled:  
-                def _to_text(m):  
-                    if m.get("role") == "assistant":  
-                        return m.get("text") or strip_html_tags(m.get("content", ""))  
-                    return m.get("content", "")  
-  
-                turns = max(1, min(MAX_REWRITE_TURNS, len(messages)))  
-                recent_texts = [_to_text(m) for m in messages[-turns:]]  
-                rq = rewrite_query(prompt, recent_texts)  
-                queries = [rq or prompt]  
+                queries = rewrite_queries_for_search_responses(messages, prompt, system_message)  
                 q.put(_sse_event("rewritten_queries", {"queries": queries}))  
   
                 strictness = 0.0  
@@ -1528,7 +1855,6 @@ def stream_message():
                     for r in results_list  
                 ])[:50000]  
   
-                # 検索ファイル一覧  
                 for r in results_list:  
                     title = r.get('title', '不明')  
                     content = r.get('content', '')  
@@ -1550,16 +1876,15 @@ def stream_message():
                                 url = generate_sas_url(blob_client, blobname)  
                         except Exception as e:  
                             print("SAS/ダウンロードURL生成エラー:", e)  
-                    search_files.append({'title': title, 'content': content, 'url': url})  
+                    path_display = fp or (f"{container_name}/{blobname}" if (container_name and blobname) else (r.get('url') or ''))  
+                    search_files.append({'title': title, 'content': content, 'url': url, 'filepath': path_display})  
                 result_holder["search_files"] = search_files  
                 q.put(_sse_event("search_files", search_files))  
             else:  
-                # RAG OFF: 検索もリライトも行わず、会話＋添付のみ  
                 queries = []  
                 search_files = []  
                 context = ""  
   
-            # 入力構築（system→history→直近userにコンテキスト追記）  
             input_items, target_user_index = build_responses_input_with_history(  
                 all_messages=messages,  
                 system_message=system_message,  
@@ -1568,7 +1893,6 @@ def stream_message():
                 wrap_context_with_markers=True  
             )  
   
-            # 添付付与（直近ユーザーへ。context_text が空なら最後の通常 user にフォールバック）  
             if target_user_index is None:  
                 for i in range(len(input_items) - 1, -1, -1):  
                     if input_items[i].get("role") == "user":  
@@ -1624,7 +1948,12 @@ def stream_message():
                     etype = getattr(event, "type", "")  
                     if etype == "response.output_text.delta":  
                         delta = getattr(event, "delta", "") or ""  
-                        if delta:  
+                        if isinstance(delta, str) and delta:  
+                            result_holder["full_text"] += delta  
+                            q.put(_sse_event("delta", {"text": delta}))  
+                    elif etype.endswith(".delta"):  
+                        delta = getattr(event, "delta", "")  
+                        if isinstance(delta, str) and delta:  
                             result_holder["full_text"] += delta  
                             q.put(_sse_event("delta", {"text": delta}))  
                     elif etype == "response.error":  
@@ -1633,6 +1962,15 @@ def stream_message():
                         result_holder["error"] = msg  
                         q.put(_sse_event("error", {"message": msg}))  
                 final_response = stream.get_final_response()  
+  
+            if not result_holder["full_text"]:  
+                try:  
+                    final_text = extract_output_text(final_response) or ""  
+                    if final_text:  
+                        result_holder["full_text"] = final_text  
+                        q.put(_sse_event("delta", {"text": final_text}))  
+                except Exception as e:  
+                    print("final_response からの出力抽出失敗:", e)  
   
             result_holder["reasoning_summary"] = extract_reasoning_summary(final_response)  
             full_text = result_holder["full_text"]  
@@ -1644,7 +1982,31 @@ def stream_message():
   
             if result_holder["reasoning_summary"]:  
                 q.put(_sse_event("reasoning_summary", {"summary": result_holder["reasoning_summary"]}))  
-            q.put(_sse_event("final", {"html": assistant_html}))  
+  
+            if ENABLE_RAGAS and RAGAS_AVAILABLE and result_holder["full_text"]:  
+                try:  
+                    contexts = [sf.get("content", "") for sf in (result_holder.get("search_files") or []) if isinstance(sf.get("content"), str)]  
+                    ragas_scores = compute_ragas_metrics(prompt, contexts, result_holder["full_text"])  
+                    result_holder["ragas_scores"] = ragas_scores  
+                    if ragas_scores:  
+                        q.put(_sse_event("ragas_metrics", ragas_scores))  
+                except Exception as e:  
+                    print("RAGAS SSE error:", e)  
+  
+            q.put(_sse_event("final", {"html": assistant_html, "session_id": active_sid}))  
+  
+            try:  
+                persist_assistant_message(  
+                    active_sid=active_sid,  
+                    assistant_html=assistant_html,  
+                    full_text=result_holder["full_text"],  
+                    ragas_scores=result_holder.get("ragas_scores", {}),  
+                    system_message=system_message  
+                )  
+                result_holder["persisted"] = True  
+            except Exception as e:  
+                print("producer 内の履歴保存エラー（保険）:", e)  
+  
         except Exception as e:  
             print("SSE producer エラー:", e)  
             traceback.print_exc()  
@@ -1674,25 +2036,14 @@ def stream_message():
                 break  
             yield chunk  
         try:  
-            if result_holder["assistant_html"] or result_holder["full_text"]:  
-                msgs = session.get("main_chat_messages", [])  
-                msgs.append({  
-                    "role": "assistant",  
-                    "content": result_holder["assistant_html"],  
-                    "type": "html",  
-                    "text": result_holder["full_text"]  
-                })  
-                session["main_chat_messages"] = msgs  
-                session.modified = True  
-                idx2 = session.get("current_chat_index", 0)  
-                sidebar2 = session.get("sidebar_messages", [])  
-                if idx2 < len(sidebar2):  
-                    sidebar2[idx2]["messages"] = msgs  
-                    if not sidebar2[idx2].get("first_assistant_message"):  
-                        sidebar2[idx2]["first_assistant_message"] = result_holder["full_text"]  
-                    session["sidebar_messages"] = sidebar2  
-                    session.modified = True  
-                save_chat_history()  
+            if (result_holder["assistant_html"] or result_holder["full_text"]) and not result_holder.get("persisted"):  
+                persist_assistant_message(  
+                    active_sid=active_sid,  
+                    assistant_html=result_holder["assistant_html"],  
+                    full_text=result_holder["full_text"],  
+                    ragas_scores=result_holder.get("ragas_scores", {}),  
+                    system_message=system_message  
+                )  
         except Exception as e:  
             print("SSE後処理の履歴保存エラー:", e)  
             traceback.print_exc()  

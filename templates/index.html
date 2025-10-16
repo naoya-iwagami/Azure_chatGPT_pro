@@ -12,7 +12,6 @@
     #searchFilesDisplay {margin-bottom:1em;}  
     #searchFilesDisplay ul {margin-bottom:0; padding-left:1.2em;}  
     .small-muted { font-size: 0.9em; color: #666; }  
-    /* 検索に利用された文書の一覧スクロール領域 */  
     #searchFilesUlContainer {  
       max-height: 50vh;  
       overflow-y: auto;  
@@ -152,21 +151,20 @@
       </form>  
   
       <h4>チャット履歴</h4>  
-      <ul class="chat-history">  
+      <ul class="chat-history" id="chatHistoryList">  
         {% if chat_sessions %}  
-          {% set answered = chat_sessions | selectattr('first_assistant_message') | list %}  
           {% if not show_all_history %}  
-            {% set display_sessions = answered[:max_displayed_history] %}  
+            {% set display_sessions = chat_sessions[:max_displayed_history] %}  
           {% else %}  
-            {% set display_sessions = answered[:max_total_history] %}  
+            {% set display_sessions = chat_sessions[:max_total_history] %}  
           {% endif %}  
           {% for chat in display_sessions %}  
-            <li>  
+            {% set title = chat.first_assistant_message or '新規チャット' %}  
+            <li data-session-id="{{ chat.session_id }}">  
               <form method="POST">  
                 <input type="hidden" name="select_chat" value="{{ chat.session_id }}">  
                 <button type="submit" class="btn btn-link sidebar-button">  
-                  {{ chat.first_assistant_message[:10] }}  
-                  {% if chat.first_assistant_message|length > 10 %}…{% endif %}  
+                  {{ title[:10] }}{% if title|length > 10 %}…{% endif %}  
                 </button>  
               </form>  
             </li>  
@@ -185,8 +183,8 @@
       <form method="POST">  
         <button type="submit" name="new_chat" value="true" class="btn btn-primary mt-2">新しいチャット</button>  
       </form>  
-      <hr>  
   
+      <hr>  
       <h4>ファイルアップロード（画像・PDF）</h4>  
       <form method="POST" enctype="multipart/form-data">  
         <div class="form-group">  
@@ -259,11 +257,19 @@
                 {% else %}  
                   <p>{{ msg.content|e }}</p>  
                 {% endif %}  
+                {% if msg.ragas %}  
+                  <div class="ragas-metrics alert alert-secondary" style="font-size:0.85em; margin-top:6px;">  
+                    <strong>RAGAS OK評価結果（GTなし）</strong><br>  
+                    Faithfulness: {{ (msg.ragas.faithfulness * 100)|round(1) if msg.ragas.faithfulness is defined else '-' }}%<br>  
+                    Answer Relevancy: {{ (msg.ragas.answer_relevancy * 100)|round(1) if msg.ragas.answer_relevancy is defined else '-' }}%<br>  
+                    Context Precision: {{ (msg.ragas.context_precision * 100)|round(1) if msg.ragas.context_precision is defined else '-' }}%<br>  
+                    Context Relevancy: {{ (msg.ragas.context_relevancy * 100)|round(1) if msg.ragas.context_relevancy is defined else '-' }}  
+                  </div>  
+                {% endif %}  
               {% endif %}  
             </div>  
           </div>  
         {% endfor %}  
-        <!-- Reasoning summaryはここには静的に出しません。JSで追加 -->  
       </div>  
   
       <!-- RAG文書表示欄 -->  
@@ -285,20 +291,14 @@
   </div>  
 </div>  
   
+<!-- 現在の会話ID（JSから参照） -->  
+<div id="currentSession" data-session-id="{{ session.get('current_session_id','') }}" style="display:none;"></div>  
+  
 <div id="docModalContainer"></div>  
 <script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>  
 <script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>  
   
 <script>  
-/*  
-  二段階方式のSSE:  
-  1) /prepare_stream にPOSTして message_id を取得  
-  2) /stream_message?mid=... に EventSource で接続（URL長制限回避）  
-  
-  追加:  
-  - サイドバー設定のAJAX反映 (/update_settings)  
-  - RAG ON/OFF スイッチ  
-*/  
 document.addEventListener('DOMContentLoaded', function() {  
   const promptTextarea = document.getElementById('promptTextarea');  
   if (sessionStorage.getItem('chat_input')) {  
@@ -318,14 +318,17 @@ document.addEventListener('DOMContentLoaded', function() {
   const searchFilesDisplay = document.getElementById('searchFilesDisplay');  
   let currentSearchFiles = [];  
   
-  // 直近のユーザーバブル（リライト表示に使う）  
   let lastUserBubbleEl = null;  
   
   function scrollChatToBottom() { chatBox.scrollTop = chatBox.scrollHeight; }  
+  
   function escapeHtml(str) {  
     if (!str) return '';  
-    return str.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));  
+    return str.replace(/[&<>"']/g, m => (  
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]  
+    ));  
   }  
+  
   function showLoading() { loadingInline.style.display = 'flex'; }  
   function hideLoading() { loadingInline.style.display = 'none'; }  
   hideLoading();  
@@ -343,7 +346,6 @@ document.addEventListener('DOMContentLoaded', function() {
     return bubble;  
   }  
   
-  // 任意改善版: リライト結果をユーザーメッセージ直下に表示  
   function renderRewrittenQueriesUnder(targetBubbleEl, payload) {  
     try {  
       if (!targetBubbleEl) return;  
@@ -373,7 +375,6 @@ document.addEventListener('DOMContentLoaded', function() {
         li0.textContent = baseQuery + '（基準）';  
         list.appendChild(li0);  
       }  
-  
       queries.forEach(q => {  
         const li = document.createElement('li');  
         li.textContent = q;  
@@ -401,25 +402,14 @@ document.addEventListener('DOMContentLoaded', function() {
   
   function replaceAssistantContainerHtml(targetEl, html) {  
     if (targetEl) {  
-      targetEl.innerHTML = html; // サーバ側でMarkdown→HTML変換済み  
+      targetEl.innerHTML = html;  
     }  
   }  
   
   function updateAssistantContainerText(targetEl, text) {  
     if (targetEl) {  
-      targetEl.textContent = text; // 途中はプレーンテキストで高速に更新  
+      targetEl.textContent = text;  
     }  
-  }  
-  
-  function appendAssistantMessage(html) {  
-    const c = document.createElement('div');  
-    c.className = 'message-container assistant';  
-    c.innerHTML = `<div class="message-bubble">  
-        <strong>アシスタント:</strong>  
-        <div class="assistant-message">${html}</div>  
-      </div>`;  
-    chatBox.appendChild(c);  
-    scrollChatToBottom();  
   }  
   
   function appendReasoningSummary(summary) {  
@@ -438,7 +428,6 @@ document.addEventListener('DOMContentLoaded', function() {
     currentSearchFiles = [];  
   }  
   
-  // RAG文書の一覧描画  
   function renderSearchFiles(files) {  
     if (!Array.isArray(files) || files.length === 0) {  
       clearSearchFilesDisplay();  
@@ -453,7 +442,8 @@ document.addEventListener('DOMContentLoaded', function() {
       const dlBtn = (file.url)  
         ? `<a href="${file.url}" download style="margin-left:8px;" class="btn btn-link btn-sm" title="ダウンロード" target="_blank"><span class="fa fa-download"></span>ダウンロード</a>`  
         : '';  
-      ul += `<li><span class="doc-num">${idx + 1}.</span> <a href="#" class="doclink" data-docidx="${idx}" style="text-decoration:underline; cursor:pointer">${escapeHtml(file.title)}</a> ${dlBtn}</li>`;  
+      const pathText = file.filepath ? ` <span class="small-muted">(${escapeHtml(file.filepath)})</span>` : '';  
+      ul += `<li><span class="doc-num">${idx + 1}.</span> <a href="#" class="doclink" data-docidx="${idx}" style="text-decoration:underline; cursor:pointer">${escapeHtml(file.title)}</a>${pathText} ${dlBtn}</li>`;  
     });  
     ul += `</ul></div>`;  
   
@@ -470,7 +460,35 @@ document.addEventListener('DOMContentLoaded', function() {
     }, 50);  
   }  
   
-  // 二段階SSE開始（長文対応）  
+  function extractTitleFromHtml(html, maxLen = 10) {  
+    const tmp = document.createElement('div');  
+    tmp.innerHTML = html || '';  
+    const text = (tmp.textContent || tmp.innerText || '').trim();  
+    if (!text) return '無題';  
+    return text.length > maxLen ? text.slice(0, maxLen) + '…' : text;  
+  }  
+  
+  function upsertSidebarItemById(sid, title) {  
+    if (!sid) return;  
+    const ul = document.getElementById('chatHistoryList');  
+    if (!ul) return;  
+    let li = ul.querySelector('li[data-session-id="' + sid + '"]');  
+    const safeTitle = escapeHtml(title || '無題');  
+    if (!li) {  
+      li = document.createElement('li');  
+      li.setAttribute('data-session-id', sid);  
+      li.innerHTML = `  
+        <form method="POST">  
+          <input type="hidden" name="select_chat" value="${sid}">  
+          <button type="submit" class="btn btn-link sidebar-button">${safeTitle}</button>  
+        </form>`;  
+      ul.insertBefore(li, ul.firstChild);  
+    } else {  
+      const btn = li.querySelector('button.sidebar-button');  
+      if (btn) btn.textContent = title || '無題';  
+    }  
+  }  
+  
   function startSSE(prompt) {  
     const streamEl = appendAssistantStreamContainer();  
     let accText = '';  
@@ -479,7 +497,6 @@ document.addEventListener('DOMContentLoaded', function() {
     showLoading();  
     clearSearchFilesDisplay();  
   
-    // 1) まずPOSTで長文promptを送る  
     fetch('/prepare_stream', {  
       method: 'POST',  
       headers: {'Content-Type': 'application/json'},  
@@ -492,17 +509,14 @@ document.addEventListener('DOMContentLoaded', function() {
     .then(({ message_id }) => {  
       if (!message_id) throw new Error('no message_id');  
   
-      // 2) SSE開始  
       const es = new EventSource('/stream_message?mid=' + encodeURIComponent(message_id));  
   
       es.addEventListener('rewritten_queries', ev => {  
         try { renderRewrittenQueriesUnder(lastUserBubbleEl, JSON.parse(ev.data)); } catch (_) {}  
       });  
-  
       es.addEventListener('search_files', ev => {  
         try { renderSearchFiles(JSON.parse(ev.data)); } catch (_) {}  
       });  
-  
       es.addEventListener('delta', ev => {  
         try {  
           const data = JSON.parse(ev.data);  
@@ -512,16 +526,21 @@ document.addEventListener('DOMContentLoaded', function() {
           }  
         } catch (_) {}  
       });  
-  
       es.addEventListener('final', ev => {  
         try {  
           const data = JSON.parse(ev.data);  
           if (data && typeof data.html === 'string') {  
             replaceAssistantContainerHtml(streamEl, data.html);  
+            const title = extractTitleFromHtml(data.html, 10);  
+            const sid = data.session_id || (document.getElementById('currentSession')?.dataset.sessionId || '');  
+            if (sid) {  
+              upsertSidebarItemById(sid, title);  
+              const sidEl = document.getElementById('currentSession');  
+              if (sidEl) sidEl.dataset.sessionId = sid;  
+            }  
           }  
         } catch (_) {}  
       });  
-  
       es.addEventListener('reasoning_summary', ev => {  
         try {  
           const data = JSON.parse(ev.data);  
@@ -530,23 +549,38 @@ document.addEventListener('DOMContentLoaded', function() {
           }  
         } catch (_) {}  
       });  
-  
+      es.addEventListener('ragas_metrics', ev => {  
+        try {  
+          const data = JSON.parse(ev.data);  
+          const bubble = streamEl.closest('.message-bubble') || streamEl.parentElement;  
+          const wrap = document.createElement('div');  
+          wrap.className = 'ragas-metrics alert alert-secondary';  
+          const fmt = (v) => (typeof v === 'number' ? (v * 100).toFixed(1) + '%' : '-');  
+          wrap.innerHTML =  
+            '<strong>RAGAS OK評価結果（GTなし）</strong><br>' +  
+            'Faithfulness: ' + fmt(data.faithfulness) + '<br>' +  
+            'Answer Relevancy: ' + fmt(data.answer_relevancy) + '<br>' +  
+            'Context Precision: ' + fmt(data.context_precision) + '<br>' +  
+            'Context Relevancy: ' + fmt(data.context_relevancy);  
+          bubble.appendChild(wrap);  
+          scrollChatToBottom();  
+        } catch (_) {}  
+      });  
       es.addEventListener('error', ev => {  
         try { console.error('SSE error event:', JSON.parse(ev.data)); } catch (_) {}  
       });  
-  
       es.addEventListener('done', ev => {  
         es.close();  
         sendButton.disabled = false;  
         hideLoading();  
         scrollChatToBottom();  
       });  
-  
       es.onerror = function(err) {  
         console.error('SSE connection error:', err);  
         es.close();  
         sendButton.disabled = false;  
         hideLoading();  
+        fallbackJsonSubmit(prompt);  
       };  
     })  
     .catch(err => {  
@@ -557,7 +591,6 @@ document.addEventListener('DOMContentLoaded', function() {
     });  
   }  
   
-  // 既存の fetch(JSON) へのフォールバック  
   function fallbackJsonSubmit(prompt) {  
     sendButton.disabled = true;  
     showLoading();  
@@ -573,6 +606,7 @@ document.addEventListener('DOMContentLoaded', function() {
       if (Array.isArray(data.rewritten_queries)) {  
         renderRewrittenQueriesUnder(lastUserBubbleEl, { queries: data.rewritten_queries });  
       }  
+      let assistantEl = null;  
       if (data.response) {  
         const c = document.createElement('div');  
         c.className = 'message-container assistant';  
@@ -581,6 +615,15 @@ document.addEventListener('DOMContentLoaded', function() {
             <div class="assistant-message">${data.response}</div>  
           </div>`;  
         chatBox.appendChild(c);  
+        assistantEl = c.querySelector('.assistant-message');  
+  
+        const t = extractTitleFromHtml(data.response, 10);  
+        const sid = data.session_id || (document.getElementById('currentSession')?.dataset.sessionId || '');  
+        if (sid) {  
+          upsertSidebarItemById(sid, t);  
+          const sidEl = document.getElementById('currentSession');  
+          if (sidEl) sidEl.dataset.sessionId = sid;  
+        }  
       }  
       if (Array.isArray(data.search_files) && data.search_files.length > 0) {  
         renderSearchFiles(data.search_files);  
@@ -599,8 +642,7 @@ document.addEventListener('DOMContentLoaded', function() {
     });  
   }  
   
-  // 入力送信ハンドラ  
-  chatForm.addEventListener('submit', e => {  
+  document.getElementById('chatForm').addEventListener('submit', e => {  
     e.preventDefault();  
     const prompt = promptTextarea.value.trim();  
     if (!prompt) return;  
@@ -615,48 +657,40 @@ document.addEventListener('DOMContentLoaded', function() {
     }  
   });  
   
-  // RAG文書のクリックでモーダル表示  
   searchFilesDisplay.addEventListener('click', function(e) {  
     if (e.target && e.target.classList.contains('doclink')) {  
       e.preventDefault();  
       const idx = e.target.getAttribute('data-docidx');  
       const doc = currentSearchFiles && currentSearchFiles[idx];  
       if (doc) {  
-        showModalDocument(doc.title, doc.content);  
+        let modalHtml = `  
+          <div class="modal fade" id="docModal" tabindex="-1">  
+            <div class="modal-dialog modal-lg"><div class="modal-content">  
+            <div class="modal-header">  
+              <h5 class="modal-title"></h5>  
+              <button type="button" class="close" data-dismiss="modal">&times;</button>  
+            </div>  
+            <div class="modal-body" style="white-space:pre-wrap; font-family:monospace; max-height:60vh; overflow:auto;"></div>  
+            </div></div>  
+          </div>`;  
+        let modalContainer = document.getElementById('docModalContainer');  
+        modalContainer.innerHTML = modalHtml;  
+        $('#docModal .modal-title').text(doc.title);  
+        $('#docModal .modal-body').text(doc.content);  
+        $('#docModal').modal('show');  
       }  
     }  
   });  
   
-  function showModalDocument(title, content) {  
-    let modalHtml = `  
-      <div class="modal fade" id="docModal" tabindex="-1">  
-        <div class="modal-dialog modal-lg"><div class="modal-content">  
-        <div class="modal-header">  
-          <h5 class="modal-title"></h5>  
-          <button type="button" class="close" data-dismiss="modal">&times;</button>  
-        </div>  
-        <div class="modal-body" style="white-space:pre-wrap; font-family:monospace; max-height:60vh; overflow:auto;"></div>  
-        </div></div>  
-      </div>`;  
-    let modalContainer = document.getElementById('docModalContainer');  
-    modalContainer.innerHTML = modalHtml;  
-    $('#docModal .modal-title').text(title);  
-    $('#docModal .modal-body').text(content);  
-    $('#docModal').modal('show');  
-  }  
-  
-  // Enterで送信（Shift+Enter で改行）  
   promptTextarea.addEventListener('keydown', e => {  
     if (e.key==='Enter' && !e.shiftKey) {  
       e.preventDefault();  
-      chatForm.dispatchEvent(new Event('submit'));  
+      document.getElementById('chatForm').dispatchEvent(new Event('submit'));  
     }  
   });  
   
-  // 初期スクロール  
   (function(){ chatBox.scrollTop = chatBox.scrollHeight; })();  
   
-  // ------------------ 設定変更のAJAX反映 ------------------  
   function postSettings(payload) {  
     return fetch('/update_settings', {  
       method: 'POST',  
@@ -668,11 +702,10 @@ document.addEventListener('DOMContentLoaded', function() {
     }).catch(e => console.error(e));  
   }  
   
-  // モデル選択と reasoning_effort 有効/無効  
   const modelSelect = document.getElementById('model_select');  
   const reasoningEffortSelect = document.getElementById('reasoning_effort');  
   function updateReasoningSelectState(model) {  
-    const enabledModels = ['o3','o4-mini','gpt-5']; // 対応モデル  
+    const enabledModels = ['o3','o4-mini','gpt-5'];  
     if (reasoningEffortSelect) {  
       reasoningEffortSelect.disabled = !enabledModels.includes(model);  
     }  
@@ -682,7 +715,6 @@ document.addEventListener('DOMContentLoaded', function() {
       const model = this.value;  
       postSettings({ selected_model: model }).then(() => updateReasoningSelectState(model));  
     });  
-    // 初期反映  
     updateReasoningSelectState(modelSelect.value);  
   }  
   if (reasoningEffortSelect) {  
@@ -691,7 +723,6 @@ document.addEventListener('DOMContentLoaded', function() {
     });  
   }  
   
-  // 検索インデックス  
   const indexSelect = document.getElementById('index_select');  
   if (indexSelect) {  
     indexSelect.addEventListener('change', function() {  
@@ -699,7 +730,6 @@ document.addEventListener('DOMContentLoaded', function() {
     });  
   }  
   
-  // ドキュメント数  
   const docCountInput = document.getElementById('doc_count');  
   if (docCountInput) {  
     docCountInput.addEventListener('change', function() {  
@@ -708,7 +738,6 @@ document.addEventListener('DOMContentLoaded', function() {
     });  
   }  
   
-  // 履歴数  
   const histInput = document.getElementById('history_to_send');  
   if (histInput) {  
     histInput.addEventListener('change', function() {  
@@ -717,7 +746,6 @@ document.addEventListener('DOMContentLoaded', function() {
     });  
   }  
   
-  // system_message（blurで送る）  
   const sysMsgTextarea = document.querySelector('textarea[name="system_message"]');  
   if (sysMsgTextarea) {  
     sysMsgTextarea.addEventListener('blur', function() {  
@@ -725,7 +753,6 @@ document.addEventListener('DOMContentLoaded', function() {
     });  
   }  
   
-  // RAGスイッチ  
   const ragSwitch = document.getElementById('ragEnabled');  
   if (ragSwitch) {  
     ragSwitch.addEventListener('change', function() {  
@@ -742,10 +769,7 @@ document.addEventListener('DOMContentLoaded', function() {
   const KEY = 'pmc_active_tabs';  
   let cleaned = false;  
   
-  function get() {  
-    try { return parseInt(localStorage.getItem(KEY) || '0', 10) || 0; }  
-    catch (e) { return 0; }  
-  }  
+  function get() { try { return parseInt(localStorage.getItem(KEY) || '0', 10) || 0; } catch (e) { return 0; } }  
   function set(v) { try { localStorage.setItem(KEY, String(v)); } catch (e) {} }  
   function inc() { set(get() + 1); }  
   function dec() { const v = Math.max(0, get() - 1); set(v); return v; }  

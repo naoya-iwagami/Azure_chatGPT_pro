@@ -6,11 +6,11 @@ html, body {
         overflow: hidden;  
 }  
   
+/* レイアウト */  
 .container-fluid {  
         padding: 0;  
         height: 100%;  
 }  
-  
 .row {  
         height: 100%;  
         margin: 0;  
@@ -127,7 +127,7 @@ html, body {
         color: #0056b3;  
 }  
   
-/* 見出し[この質問で検索に利用された文書] のデザイン（落ち着いた青系） */  
+/* 見出し[この質問で検索に利用された文書] */  
 #searchFilesToggle {  
         font-size: 1.2em;  
         font-weight: bold;  
@@ -154,7 +154,7 @@ html, body {
 }  
 #searchFilesUlContainer .doc-num {  
         display: inline-block;  
-        width: 1.6em;   /* 2桁でもズレないよう固定幅 */  
+        width: 1.6em;  
         font-weight: 600;  
         color: #1563a6;  
 }  
@@ -179,4 +179,14 @@ html, body {
 }  
 .rq-list li {  
         margin-bottom: 2px;  
+}  
+  
+/* RAGAS メトリクス表示 */  
+.ragas-metrics {  
+        font-size: 0.85em;  
+        background: #eef7ee;  
+        border-left: 4px solid #3c763d;  
+        padding: 6px 10px;  
+        border-radius: 6px;  
+        margin-top: 6px;  
 }  
