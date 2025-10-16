@@ -70,10 +70,6 @@ try:
 except Exception:  
     RAGAS_AVAILABLE = False  
   
-# 会社プロキシ（必要なら）  
-os.environ['HTTP_PROXY'] = os.getenv('HTTP_PROXY', 'http://g3.konicaminolta.jp:8080')  
-os.environ['HTTPS_PROXY'] = os.getenv('HTTPS_PROXY', 'http://g3.konicaminolta.jp:8080')  
-  
 # ------------------------------- Azure OpenAI クライアント設定 -------------------------------  
 client = AzureOpenAI(  
     api_key=os.getenv("AZURE_OPENAI_KEY"),  
