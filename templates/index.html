@@ -428,6 +428,7 @@ document.addEventListener('DOMContentLoaded', function() {
     currentSearchFiles = [];  
   }  
   
+  // ここを修正: ファイル名の右側に「フォルダ名」だけを表示（重複回避）  
   function renderSearchFiles(files) {  
     if (!Array.isArray(files) || files.length === 0) {  
       clearSearchFilesDisplay();  
@@ -439,11 +440,17 @@ document.addEventListener('DOMContentLoaded', function() {
     let title = `<span id="searchFilesToggle" style="cursor:pointer; text-decoration:underline;">この質問で検索に利用された文書</span>`;  
     let ul = `<div id="searchFilesUlContainer" style="display:none;" tabindex="0"><ul>`;  
     files.forEach((file, idx) => {  
-      const dlBtn = (file.url)  
-        ? `<a href="${file.url}" download style="margin-left:8px;" class="btn btn-link btn-sm" title="ダウンロード" target="_blank"><span class="fa fa-download"></span>ダウンロード</a>`  
+      // アプリ内ルート（/download_*）はエンコード不要。外部URL（SAS等）のみ encodeURI  
+      let safeHref = '';  
+      if (typeof file?.url === 'string') {  
+        safeHref = file.url.startsWith('/download_') ? file.url : encodeURI(file.url);  
+      }  
+      const dlBtn = (safeHref)  
+        ? `<a href="${safeHref}" download style="margin-left:8px;" class="btn btn-link btn-sm" title="ダウンロード" target="_blank" rel="noopener"><span class="fa fa-download"></span>ダウンロード</a>`  
         : '';  
-      const pathText = file.filepath ? ` <span class="small-muted">(${escapeHtml(file.filepath)})</span>` : '';  
-      ul += `<li><span class="doc-num">${idx + 1}.</span> <a href="#" class="doclink" data-docidx="${idx}" style="text-decoration:underline; cursor:pointer">${escapeHtml(file.title)}</a>${pathText} ${dlBtn}</li>`;  
+      const folderText = (typeof file?.folder === 'string' && file.folder)  
+        ? ` <span class="small-muted">(${escapeHtml(file.folder)})</span>` : '';  
+      ul += `<li><span class="doc-num">${idx + 1}.</span> <a href="#" class="doclink" data-docidx="${idx}" style="text-decoration:underline; cursor:pointer">${escapeHtml(file.title)}</a>${folderText} ${dlBtn}</li>`;  
     });  
     ul += `</ul></div>`;  
   
@@ -627,18 +634,19 @@ document.addEventListener('DOMContentLoaded', function() {
       }  
       if (Array.isArray(data.search_files) && data.search_files.length > 0) {  
         renderSearchFiles(data.search_files);  
+      } else {  
+        clearSearchFilesDisplay();  
       }  
-      if (data.reasoning_summary) {  
-        appendReasoningSummary(data.reasoning_summary);  
-      }  
-      sendButton.disabled = false;  
-      hideLoading();  
-      scrollChatToBottom();  
     })  
     .catch(e => {  
       sendButton.disabled = false;  
       hideLoading();  
       alert('エラーが発生しました');  
+    })  
+    .finally(() => {  
+      sendButton.disabled = false;  
+      hideLoading();  
+      scrollChatToBottom();  
     });  
   }  
   
@@ -682,7 +690,8 @@ document.addEventListener('DOMContentLoaded', function() {
     }  
   });  
   
-  promptTextarea.addEventListener('keydown', e => {  
+  const promptTextareaEl = document.getElementById('promptTextarea');  
+  promptTextareaEl.addEventListener('keydown', e => {  
     if (e.key==='Enter' && !e.shiftKey) {  
       e.preventDefault();  
       document.getElementById('chatForm').dispatchEvent(new Event('submit'));  

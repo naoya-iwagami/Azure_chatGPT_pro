@@ -1,23 +1,17 @@
-#!/usr/bin/env python3  # -*- coding: utf-8 -*-  
+#!/usr/bin/env python3  
+# -*- coding: utf-8 -*-  
 """  
-PM Compass – Flask アプリ（修正版：Cosmos優先マージ保存 + current_session_id安定化 + 初回は必ず新規チャット起動）  
-- 画像/PDFアップロード対応（input_image / input_file）  
-- セッション終了時の自動削除（sendBeacon + /cleanup_session_files）  
-- Azure Cognitive Search ハイブリッド検索（RRF融合）  
-- Azure OpenAI Responses API（ストリーミング対応）  
-- PDF は file_data(Base64) + filename 方式で添付（file_url は使用しない）  
-- アプリ側のステップ制御を廃止、LLM判断に委譲  
+PM Compass PRO – Flask アプリ（Entra ID 認証版）  
   
-追加修正（最後のメッセージしか残らない対策）  
-- ensure_messages_from_cosmos: セッションが途切れても Cosmos から履歴復元  
-- merge_messages: 既存履歴と新履歴を重複除去しながらマージ  
-- persist_assistant_message: Cosmosをソースに読み戻してから append→upsert→セッション/サイドバー反映  
-- send_message/stream_message 開始時に Cosmos 復元  
-- JSONフォールバックのレスポンスに session_id を同梱  
-- フロント: SSE final 受信時に #currentSession の data-session-id を更新  
+この版の変更点（ダウンロードを必ず通すための統一）  
+- SAS 直リンクは使わず、ダウンロードは常にアプリ中継（/download_blob, /download_txt）  
+- 画像/PDFのページ表示はアプリ中継の inline ルート（/view_blob）に統一  
+- モデルへの画像添付は SAS ではなく data: スキーム（Base64）を使用  
+- 既存の normalize_blobname（最大2回のunquote）と安全な検証を維持  
   
-追加修正（アプリ起動時は常に新規チャット）  
-- index 初回 GET（セッション未初期化）で必ず start_new_chat() を実行し、前回のチャットを自動で開かない  
+追加修正（フォルダ名の表示対応）  
+- 検索結果の各文書に folder を付与し、UI ではタイトルの右側にフォルダ名のみを表示する  
+- 既存の filepath は保持するが、表示には使わない  
 """  
   
 import os  
@@ -31,6 +25,7 @@ import datetime
 import traceback  
 import time  
 import queue  
+import mimetypes  
 from urllib.parse import quote, unquote, urlparse  
   
 from flask import (  
@@ -44,22 +39,28 @@ from flask import (
     send_file,  
     stream_with_context,  
     jsonify,  
+    abort,  
 )  
 from flask import copy_current_request_context  
 from flask_session import Session  
 from werkzeug.utils import secure_filename  
   
 import certifi  
-from azure.core.credentials import AzureKeyCredential  
 from azure.core.pipeline.transport import RequestsTransport  
 from azure.core.pipeline.policies import RetryPolicy  
+from azure.core.exceptions import ResourceNotFoundError, ClientAuthenticationError, HttpResponseError  
 from azure.search.documents import SearchClient  
 from azure.cosmos import CosmosClient  
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions  
 from openai import AzureOpenAI  
 import markdown2  
+from azure.identity import AzureCliCredential, ManagedIdentityCredential  
   
-# RAGAS（任意依存）  
+# 必要な環境でプロキシを使用  
+os.environ['HTTP_PROXY'] = os.getenv('HTTP_PROXY', 'http://g3.konicaminolta.jp:8080')  
+os.environ['HTTPS_PROXY'] = os.getenv('HTTPS_PROXY', 'http://g3.konicaminolta.jp:8080')  
+  
+# RAGAS（任意依存; 未インストールでもOK）  
 try:  
     from datasets import Dataset  
     from ragas import evaluate  
@@ -70,19 +71,80 @@ try:
 except Exception:  
     RAGAS_AVAILABLE = False  
   
-# ------------------------------- Azure OpenAI クライアント設定 -------------------------------  
+# ------------------------------- アプリ環境/Flask -------------------------------  
+APP_ENV = os.getenv("APP_ENV", "prod").lower()  
+IS_LOCAL = APP_ENV == "local"  
+  
+app = Flask(__name__)  
+app.secret_key = os.getenv('FLASK_SECRET_KEY', 'your-default-secret-key')  
+app.config['SESSION_TYPE'] = 'filesystem'  
+app.config['SESSION_FILE_DIR'] = '/tmp/flask_session'  
+app.config['SESSION_PERMANENT'] = False  
+app.config['MAX_CONTENT_LENGTH'] = int(os.getenv("MAX_UPLOAD_MB", "100")) * 1024 * 1024  # 100MB  
+os.makedirs(app.config['SESSION_FILE_DIR'], exist_ok=True)  
+Session(app)  
+  
+# ローカルではSASリンクを既定ON、本番では既定OFF（必要に応じて上書き）  
+# この版ではSASは使用せず、常に中継を使用するため、この設定値に関わらず中継を使います。  
+USE_SAS_LINKS = os.getenv("USE_SAS_LINKS", "true" if IS_LOCAL else "false").lower() == "true"  
+  
+# ------------------------------- 共通 RequestsTransport/Retry 設定 -------------------------------  
+def _build_requests_transport():  
+    proxies = {}  
+    http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")  
+    https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")  
+    if http_proxy:  
+        proxies["http"] = http_proxy  
+    if https_proxy:  
+        proxies["https"] = https_proxy  
+    verify_path = os.getenv("REQUESTS_CA_BUNDLE") or os.getenv("AZURE_CA_BUNDLE") or certifi.where()  
+    conn_timeout = int(os.getenv("AZURE_HTTP_CONN_TIMEOUT", "20"))  
+    read_timeout = int(os.getenv("AZURE_HTTP_READ_TIMEOUT", "120"))  
+    return RequestsTransport(  
+        connection_verify=verify_path,  
+        proxies=proxies or None,  
+        connection_timeout=conn_timeout,  
+        read_timeout=read_timeout,  
+    )  
+  
+transport = _build_requests_transport()  
+retry_policy = RetryPolicy(  
+    retry_total=int(os.getenv("AZURE_RETRY_TOTAL", "5")),  
+    retry_connect=3,  
+    retry_read=3,  
+    retry_status=3,  
+    retry_backoff_factor=float(os.getenv("AZURE_RETRY_BACKOFF", "0.8")),  
+)  
+  
+# ------------------------------- Azure Identity 認証 -------------------------------  
+def build_credential():  
+    if IS_LOCAL:  
+        return AzureCliCredential()  
+    mi_client_id = os.getenv("AZURE_CLIENT_ID")  
+    return ManagedIdentityCredential(client_id=mi_client_id) if mi_client_id else ManagedIdentityCredential()  
+  
+credential = build_credential()  
+  
+def build_azure_ad_token_provider(credential, scope):  
+    def _provider():  
+        return credential.get_token(scope).token  
+    return _provider  
+  
+aad_token_provider = build_azure_ad_token_provider(credential, "https://cognitiveservices.azure.com/.default")  
+  
+# ------------------------------- Azure OpenAI クライアント設定（AAD） -------------------------------  
 client = AzureOpenAI(  
-    api_key=os.getenv("AZURE_OPENAI_KEY"),  
     base_url=os.getenv("AZURE_OPENAI_ENDPOINT"),  
-    api_version="preview",  
+    api_version="v1",  
+    azure_ad_token_provider=aad_token_provider,  
     default_headers={"x-ms-include-response-reasoning-summary": "true"},  
 )  
   
 embed_endpoint = os.getenv("AZURE_OPENAI_EMBED_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")  
 embed_client = AzureOpenAI(  
-    api_key=os.getenv("AZURE_OPENAI_KEY"),  
     azure_endpoint=embed_endpoint,  
     api_version="2025-04-01-preview",  
+    azure_ad_token_provider=aad_token_provider,  
 )  
   
 # ------------------------------- モデル・検索設定 -------------------------------  
@@ -116,53 +178,14 @@ MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(5 * 1024 * 1024
 # RAGAS フラグ  
 ENABLE_RAGAS = os.getenv("ENABLE_RAGAS", "1") not in ("0", "false", "False")  
   
-# ------------------------------- Flask アプリ設定 -------------------------------  
-app = Flask(__name__)  
-app.secret_key = os.getenv('FLASK_SECRET_KEY', 'your-default-secret-key')  
-app.config['SESSION_TYPE'] = 'filesystem'  
-app.config['SESSION_FILE_DIR'] = '/tmp/flask_session'  
-app.config['SESSION_PERMANENT'] = False  
-app.config['MAX_CONTENT_LENGTH'] = int(os.getenv("MAX_UPLOAD_MB", "100")) * 1024 * 1024  # 100MB  
-os.makedirs(app.config['SESSION_FILE_DIR'], exist_ok=True)  
-Session(app)  
-  
-# ------------------------------- 共通 RequestsTransport/Retry 設定 -------------------------------  
-def _build_requests_transport():  
-    proxies = {}  
-    http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")  
-    https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")  
-    if http_proxy:  
-        proxies["http"] = http_proxy  
-    if https_proxy:  
-        proxies["https"] = https_proxy  
-    verify_path = os.getenv("REQUESTS_CA_BUNDLE") or os.getenv("AZURE_CA_BUNDLE") or certifi.where()  
-    conn_timeout = int(os.getenv("AZURE_HTTP_CONN_TIMEOUT", "20"))  
-    read_timeout = int(os.getenv("AZURE_HTTP_READ_TIMEOUT", "120"))  
-    return RequestsTransport(  
-        connection_verify=verify_path,  
-        proxies=proxies or None,  
-        connection_timeout=conn_timeout,  
-        read_timeout=read_timeout,  
-    )  
-  
-transport = _build_requests_transport()  
-retry_policy = RetryPolicy(  
-    retry_total=int(os.getenv("AZURE_RETRY_TOTAL", "5")),  
-    retry_connect=3,  
-    retry_read=3,  
-    retry_status=3,  
-    retry_backoff_factor=float(os.getenv("AZURE_RETRY_BACKOFF", "0.8")),  
-)  
-  
-# ------------------------------- Azure サービスクライアント -------------------------------  
+# ------------------------------- Azure サービスクライアント（AAD） -------------------------------  
 search_service_endpoint = os.getenv("AZURE_SEARCH_ENDPOINT")  
-search_service_key = os.getenv("AZURE_SEARCH_KEY")  
   
 cosmos_endpoint = os.getenv("AZURE_COSMOS_ENDPOINT")  
-cosmos_key = os.getenv("AZURE_COSMOS_KEY")  
 database_name = 'chatdb'  
 container_name = 'personalchats'  
-cosmos_client = CosmosClient(cosmos_endpoint, credential=cosmos_key) if cosmos_endpoint and cosmos_key else None  
+  
+cosmos_client = CosmosClient(cosmos_endpoint, credential=credential) if cosmos_endpoint else None  
 if cosmos_client:  
     database = cosmos_client.get_database_client(database_name)  
     container = database.get_container_client(container_name)  
@@ -170,15 +193,17 @@ else:
     database = None  
     container = None  
   
-blob_connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")  
-blob_service_client = BlobServiceClient.from_connection_string(  
-    blob_connection_string,  
-    transport=transport) if blob_connection_string else None  
+blob_account_url = os.getenv("AZURE_STORAGE_ACCOUNT_URL")  
+blob_service_client = BlobServiceClient(  
+    account_url=blob_account_url,  
+    credential=credential,  
+    transport=transport  
+) if blob_account_url else None  
   
 image_container_name = 'chatgpt-image'  
 file_container_name = 'chatgpt-files'  
   
-# コンテナ自動作成  
+# コンテナ自動作成（権限不足ならスキップ）  
 image_container_client = None  
 file_container_client = None  
 if blob_service_client:  
@@ -234,37 +259,76 @@ def to_query_language(lang: str) -> str:
   
 lock = threading.Lock()  
   
-# ------------------------------- ユーティリティ -------------------------------  
-def extract_account_key(connection_string: str) -> str:  
-    if not connection_string:  
-        return ""  
-    pairs = [s.split("=", 1) for s in connection_string.split(";") if "=" in s]  
-    return dict(pairs).get("AccountKey")  
+# ====== ダウンロード用の検証（緩和版） ======  
+ALLOWED_CONTAINERS_FOR_DOWNLOAD = set(INDEX_TO_BLOB_CONTAINER.values()) | {image_container_name, file_container_name}  
   
+def validate_blob_path(blobname: str):  
+    # パストラバーサル/絶対パス/制御文字/バックスラッシュは拒否。その他（日本語・括弧など）は許容。  
+    if ".." in blobname or blobname.startswith(("/", "\\")):  
+        abort(400)  
+    if re.search(r'[\x00-\x1f\x7f]', blobname) or "\\" in blobname:  
+        abort(400)  
+  
+def validate_container_and_path(container: str, blobname: str):  
+    if container not in ALLOWED_CONTAINERS_FOR_DOWNLOAD:  
+        abort(403)  
+    validate_blob_path(blobname)  
+  
+# 追加: blobname 正規化（最大2回のunquote）  
+def normalize_blobname(s: str) -> str:  
+    try:  
+        once = unquote(s)  
+        twice = unquote(once)  
+        return twice if twice != once else once  
+    except Exception:  
+        return s  
+  
+# ------------------------------- ユーティリティ -------------------------------  
 def generate_sas_url(blob_client, blob_name):  
-    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")  
-    account_key = extract_account_key(connection_string)  
-    start = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)  
-    expiry = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)  
-    sas_token = generate_blob_sas(  
-        account_name=blob_client.account_name,  
-        container_name=blob_client.container_name,  
-        blob_name=blob_name,  
-        account_key=account_key,  
-        permission=BlobSasPermissions(read=True),  
-        expiry=expiry,  
-        start=start  
-    )  
-    return f"{blob_client.url}?{sas_token}"  
+    """  
+    SASは本版では使用しませんが、将来用のヘルパーとして残しています。  
+    """  
+    if not blob_service_client or not blob_client:  
+        return ""  
+    try:  
+        start = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=15)  
+        expiry = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)  
+        udk = blob_service_client.get_user_delegation_key(start, expiry)  
+        sas_token = generate_blob_sas(  
+            account_name=blob_client.account_name,  
+            container_name=blob_client.container_name,  
+            blob_name=blob_name,  
+            user_delegation_key=udk,  
+            permission=BlobSasPermissions(read=True),  
+            start=start,  
+            expiry=expiry,  
+            protocol="https",  
+            version="2020-12-06",  
+        )  
+        return f"{blob_client.url}?{sas_token}"  
+    except Exception as e:  
+        print("SAS/UDK 発行失敗:", e)  
+        return ""  
+  
+def build_download_url(container_name: str, blobname: str, is_text: bool) -> str:  
+    """  
+    一元的なダウンロードURL生成（常にアプリ中継）。  
+    - TXT は /download_txt  
+    - 非TXT は /download_blob  
+    - url_for へ渡す blobname は quote（スラッシュ維持）  
+    """  
+    if is_text:  
+        return url_for('download_txt', container=container_name, blobname=quote(blobname))  
+    return url_for('download_blob', container=container_name, blobname=quote(blobname))  
   
 def make_blob_url(container_name: str, blobname: str) -> str:  
-    if not blob_service_client:  
-        return ""  
-    bc = blob_service_client.get_blob_client(container=container_name, blob=blobname)  
+    """  
+    画像/PDFの表示用 URL を生成（常にアプリ中継の inline 表示）。  
+    """  
     try:  
-        return generate_sas_url(bc, blobname)  
+        return url_for('view_blob', container=container_name, blobname=quote(blobname))  
     except Exception:  
-        return bc.url  
+        return ""  
   
 def encode_image_from_blob(blob_client):  
     downloader = blob_client.download_blob()  
@@ -367,24 +431,81 @@ def is_azure_blob_url(u: str) -> bool:
         return False  
   
 def resolve_blob_from_filepath(selected_index: str, path_or_url: str):  
+    """  
+    Search結果の filepath or url から (container, blobname) を復元  
+    - URL の場合は path を unquote 済みで分解  
+    - 相対パスも unquote 済みに正規化  
+    """  
     if not path_or_url:  
         return None, None  
-    s = path_or_url.strip().replace("\\", "/")  
+    s = (path_or_url or "").strip().replace("\\", "/")  
+    # URL の場合  
     if s.startswith("http://") or s.startswith("https://"):  
         if not is_azure_blob_url(s):  
             return None, None  
         try:  
             u = urlparse(s)  
-            parts = u.path.lstrip("/").split("/", 1)  
+            path = unquote(u.path)  
+            parts = path.lstrip("/").split("/", 1)  
             if len(parts) == 2:  
                 return parts[0], parts[1]  
         except Exception:  
             return None, None  
+    # 相対パス  
     container = INDEX_TO_BLOB_CONTAINER.get(selected_index, DEFAULT_BLOB_CONTAINER_FOR_SEARCH)  
-    blobname = s.lstrip("/")  
+    blobname = unquote(s.lstrip("/"))  
     if container and blobname.startswith(container + "/"):  
         blobname = blobname[len(container) + 1:]  
     return container, blobname  
+  
+def resolve_container_blob_from_result(selected_index: str, result):  
+    """  
+    Search結果から (container, blobname) を頑健に復元する。  
+    - filepath に '/' が含まれなければ url/metadata_storage_path から復元  
+    """  
+    fp = (result.get('filepath') or '').replace('\\', '/')  
+    u = result.get('url') or result.get('metadata_storage_path') or ''  
+    if fp and ('/' in fp):  
+        return resolve_blob_from_filepath(selected_index, fp)  
+    if u:  
+        if is_azure_blob_url(u):  
+            return resolve_blob_from_filepath(selected_index, u)  
+    if fp:  
+        return resolve_blob_from_filepath(selected_index, fp)  
+    return (None, None)  
+  
+# 追加: フォルダ名抽出（タイトルの右側に表示するため）  
+def extract_folder_from_blobname(blobname: str) -> str:  
+    if not blobname:  
+        return ""  
+    p = blobname.replace("\\", "/").strip("/")  
+    if "/" not in p:  
+        return ""  
+    return p.rsplit("/", 1)[0]  
+  
+def extract_folder_from_result(selected_index: str, result) -> str:  
+    try:  
+        container, blobname = resolve_container_blob_from_result(selected_index, result)  
+        if blobname:  
+            return extract_folder_from_blobname(blobname)  
+    except Exception:  
+        pass  
+    # フォールバック: filepath/url から推定  
+    try:  
+        fp = (result.get('filepath') or '').replace('\\', '/').strip('/')  
+        if '/' in fp:  
+            return fp.rsplit('/', 1)[0]  
+        u = result.get('url') or result.get('metadata_storage_path') or ''  
+        if u and is_azure_blob_url(u):  
+            path = unquote(urlparse(u).path).lstrip('/')  
+            # 先頭のコンテナ名を剥がす  
+            parts = path.split('/', 1)  
+            rel = parts[1] if len(parts) == 2 else parts[0]  
+            if '/' in rel:  
+                return rel.rsplit('/', 1)[0]  
+    except Exception:  
+        pass  
+    return ""  
   
 # ------------------------------- クエリリライト -------------------------------  
 def rewrite_queries_for_search_responses(messages: list, current_prompt: str, system_message: str = "") -> list:  
@@ -396,6 +517,7 @@ def rewrite_queries_for_search_responses(messages: list, current_prompt: str, sy
         if m.get("role") == "assistant":  
             return m.get("text") or strip_html_tags(m.get("content", "")) or ""  
         return m.get("content", "") or ""  
+  
     recent = filtered[-(max_query_history_turns * 3):]  
     history_lines = []  
     if system_message:  
@@ -408,12 +530,12 @@ def rewrite_queries_for_search_responses(messages: list, current_prompt: str, sy
         "あなたは社内文書検索クエリ生成AIです。\n"  
         "出力仕様: {\"queries\":[\"...\", \"...\"]} の JSON を 1 行だけ返す。\n"  
         "・各クエリは30文字以内、日本語主体、必要なら英語同義語併記。\n"  
-        "・最大10件生成。\n"  
+        "・最大4件生成。\n"  
         "・説明・前後の余分な文字・改行は禁止。"  
     )  
     user_prompt = (  
         f"history{{{context}}}\n"  
-        f"endtask ユーザの意図を最もよく表す検索クエリを最大10件生成してください。\n"  
+        f"endtask ユーザの意図を最もよく表す検索クエリを最大4件生成してください。\n"  
         f"最新ユーザ質問: {current_prompt}"  
     )  
   
@@ -443,7 +565,7 @@ def rewrite_queries_for_search_responses(messages: list, current_prompt: str, sy
         qs = []  
   
     qs = [q.strip()[:30] for q in qs if isinstance(q, str) and q.strip()]  
-    qs = list(dict.fromkeys(qs))[:10]  
+    qs = list(dict.fromkeys(qs))[:4]  
     if not qs:  
         qs = [current_prompt.strip()[:30] or "検索"]  
     return qs  
@@ -470,6 +592,7 @@ def get_authenticated_user():
             return user_id  
         except Exception as e:  
             print("Easy Auth ユーザー情報の取得エラー:", e)  
+    # ローカル/未統合用のデフォルト  
     session["user_id"] = "anonymous@example.com"  
     session["user_name"] = "anonymous"  
     return session["user_id"]  
@@ -482,7 +605,6 @@ def compute_has_assistant(msgs: list) -> bool:
     )  
   
 def ensure_messages_from_cosmos(active_sid: str) -> list:  
-    """CosmosDBから当該セッションのメッセージを取得（存在しない/エラー時は[]）"""  
     if not (container and active_sid):  
         return []  
     with lock:  
@@ -494,9 +616,8 @@ def ensure_messages_from_cosmos(active_sid: str) -> list:
             return []  
   
 def merge_messages(existing: list, new: list) -> list:  
-    """既存と新規の配列を「role + (text or content)」で重複除去して結合（順序はexisting→new）"""  
     existing = existing or []  
-    new = new or []  
+    new = new = new or []  
     if not existing:  
         return new  
     if not new:  
@@ -519,7 +640,6 @@ def merge_messages(existing: list, new: list) -> list:
     return merged  
   
 def persist_assistant_message(active_sid: str, assistant_html: str, full_text: str, ragas_scores: dict, system_message: str):  
-    """Cosmosを基点にアシスタント応答を安全に保存し、セッションとサイドバーを同期"""  
     if not active_sid:  
         return  
   
@@ -589,12 +709,6 @@ def persist_assistant_message(active_sid: str, assistant_html: str, full_text: s
             traceback.print_exc()  
   
 def save_chat_history():  
-    """  
-    主会話(main_chat_messages)ベースで Cosmos に保存。  
-    - アシスタント応答がある場合のみ保存  
-    - 既存履歴とマージして短縮上書きを防ぐ  
-    - system_message はサイドバーにあればそれを優先  
-    """  
     if not container:  
         return  
     with lock:  
@@ -763,14 +877,6 @@ def delete_system_prompt(prompt_id: str):
             return False  
   
 def start_new_chat():  
-    """  
-    新規チャット開始:  
-    - 画像/PDFをクリーンアップ  
-    - 新しい session_id を発行  
-    - main_chat_messages は空にする  
-    - サイドバー（sidebar_messages）は挿入しない（空セッション非表示）  
-    - current_chat_index は変更しない（上書き防止）  
-    """  
     image_filenames = session.get("image_filenames", [])  
     for img_name in image_filenames:  
         if image_container_client:  
@@ -799,7 +905,7 @@ def get_search_client(index_name):
     return SearchClient(  
         endpoint=search_service_endpoint,  
         index_name=index_name,  
-        credential=AzureKeyCredential(search_service_key),  
+        credential=credential,  
         transport=transport,  
         retry_policy=retry_policy,  
         api_version="2024-07-01",  
@@ -898,7 +1004,7 @@ def hybrid_search_multiqueries(queries, topNDocuments, index_name, strictness=0.
         ]  
         for result_list in lists:  
             for idx, r in enumerate(result_list):  
-                dedup_key = r.get("chunk_id") or r.get("filepath") or r.get("id") or r.get("title")  
+                dedup_key = r.get("chunk_id") or r.get("filepath") or r.get("url") or r.get("id") or r.get("title")  
                 if not dedup_key:  
                     continue  
                 parent_id = r.get("parent_id")  
@@ -931,7 +1037,7 @@ def rrf_fuse_ranked_lists(lists_of_results, topNDocuments):
         req_top = 10  
     for result_list in lists_of_results:  
         for idx, r in enumerate(result_list):  
-            dedup_key = r.get("chunk_id") or r.get("filepath") or r.get("id") or r.get("title")  
+            dedup_key = r.get("chunk_id") or r.get("filepath") or r.get("url") or r.get("id") or r.get("title")  
             if not dedup_key:  
                 continue  
             contribution = 1 / (rrf_k + (idx + 1))  
@@ -995,25 +1101,26 @@ def init_ragas_clients():
         return None, None  
   
     azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")  
-    api_key = os.getenv("AZURE_OPENAI_KEY")  
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")  
-  
     judge_deploy = os.getenv("AZURE_OPENAI_RAGAS_JUDGE_DEPLOYMENT") or os.getenv("AZURE_OPENAI_RESPONSES_MODEL", "gpt-4o")  
     embed_deploy = os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT", EMBEDDING_MODEL)  
   
-    llm = ChatOpenAI(  
-        azure_endpoint=azure_endpoint,  
-        api_key=api_key,  
-        azure_deployment=judge_deploy,  
-        api_version=api_version,  
-        temperature=0  
-    )  
-    emb = OpenAIEmbeddings(  
-        azure_endpoint=embed_endpoint or azure_endpoint,  
-        api_key=api_key,  
-        azure_deployment=embed_deploy,  
-        api_version=os.getenv("AZURE_OPENAI_EMBED_API_VERSION", "2024-06-01")  
-    )  
+    try:  
+        llm = ChatOpenAI(  
+            azure_endpoint=azure_endpoint,  
+            azure_deployment=judge_deploy,  
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01"),  
+            azure_ad_token_provider=aad_token_provider,  
+            temperature=0  
+        )  
+        emb = OpenAIEmbeddings(  
+            azure_endpoint=embed_endpoint or azure_endpoint,  
+            azure_deployment=embed_deploy,  
+            api_version=os.getenv("AZURE_OPENAI_EMBED_API_VERSION", "2024-06-01"),  
+            azure_ad_token_provider=aad_token_provider,  
+        )  
+    except TypeError:  
+        print("langchain_openai が AAD を未サポートのため RAGAS を無効化します。")  
+        return None, None  
   
     RAGAS_LLM_WRAPPER = LangchainLLMWrapper(llm)  
     RAGAS_EMB_WRAPPER = LangchainEmbeddingsWrapper(emb)  
@@ -1115,26 +1222,14 @@ def build_responses_input_with_history(
             last_user_index = i  
             break  
   
-    target_user_index = last_user_index  
     if context_text:  
-        ctx = (  
-            f"{context_title}:\nBEGIN_CONTEXT\n{context_text}\nEND_CONTEXT"  
-            if wrap_context_with_markers else context_text  
-        )  
+        ctx = f"{context_title}:\nBEGIN_CONTEXT\n{context_text}\nEND_CONTEXT" if wrap_context_with_markers else context_text  
         if last_user_index is not None:  
-            input_items[last_user_index]["content"].append({  
-                "type": "input_text",  
-                "text": ctx  
-            })  
-            target_user_index = last_user_index  
+            input_items[last_user_index]["content"].append({"type": "input_text", "text": ctx})  
         else:  
-            input_items.append({  
-                "role": "user",  
-                "content": [{"type": "input_text", "text": ctx}]  
-            })  
-            target_user_index = len(input_items) - 1  
+            input_items.append({"role": "user", "content": [{"type": "input_text", "text": ctx}]})  
   
-    return input_items, target_user_index  
+    return input_items, last_user_index  
   
 # ------------------------------- セッション内ファイル一括削除 -------------------------------  
 def _delete_uploaded_files_for_session():  
@@ -1160,7 +1255,6 @@ def _delete_uploaded_files_for_session():
                         deleted["files"].append(name)  
                 except Exception as e:  
                     print("PDF削除失敗:", name, e)  
-        # ここではセッションを書き換えない（競合・上書き回避）  
     except Exception as e:  
         print("セッションファイル一括削除エラー:", e)  
     return deleted  
@@ -1259,14 +1353,10 @@ def index():
         start_new_chat()  
         session["initial_chat_opened"] = True  
   
-    # main_chat_messages が未設定なら空で初期化（初回は必ず空の新規チャット）  
     if "main_chat_messages" not in session:  
         session["main_chat_messages"] = []  
-  
-    # current_session_id の初期補完（万一欠落時）  
     if "current_session_id" not in session or not session.get("current_session_id"):  
         start_new_chat()  
-  
     if "image_filenames" not in session:  
         session["image_filenames"] = []  
     if "file_filenames" not in session:  
@@ -1283,13 +1373,11 @@ def index():
   
     # --- POST ハンドラ ---  
     if request.method == 'POST':  
-        # 新しいチャット  
         if request.form.get('new_chat'):  
             start_new_chat()  
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # 既存チャットを選択  
         if 'select_chat' in request.form:  
             sid = request.form.get('select_chat')  
             sb = session.get("sidebar_messages", [])  
@@ -1303,13 +1391,11 @@ def index():
                     break  
             return redirect(url_for('index'))  
   
-        # 履歴の表示件数トグル  
         if 'toggle_history' in request.form:  
             session["show_all_history"] = not bool(session.get("show_all_history", False))  
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # system_message の直接更新（session_id ベース）  
         if 'set_system_message' in request.form:  
             sys_msg = (request.form.get('system_message') or '').strip()  
             session["default_system_message"] = sys_msg  
@@ -1324,9 +1410,8 @@ def index():
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # 登録済みプロンプトを適用（session_id ベース）  
         if 'apply_system_prompt' in request.form:  
-            prompt_id = request.form.get('select_prompt_id')  
+            prompt_id = request.form.get("select_prompt_id")  
             saved = session.get("saved_prompts", [])  
             match = next((p for p in saved if p.get("id") == prompt_id), None)  
             if match:  
@@ -1342,7 +1427,6 @@ def index():
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # 新しい指示を保存  
         if 'add_system_prompt' in request.form:  
             title = (request.form.get('prompt_title') or '').strip()  
             content = (request.form.get('prompt_content') or '').strip()  
@@ -1353,7 +1437,6 @@ def index():
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # （フォーム直送のためのフォールバック設定。AJAXが効いていない環境用）  
         if 'set_model' in request.form:  
             selected = (request.form.get('model') or '').strip()  
             allowed_models = {"gpt-4o", "gpt-4.1", "o3", "o4-mini", "gpt-5"}  
@@ -1390,7 +1473,7 @@ def index():
         # 画像/PDFアップロード  
         if 'upload_files' in request.form:  
             if not blob_service_client or not file_container_client or not image_container_client:  
-                flash("ストレージ未設定です。環境変数 AZURE_STORAGE_CONNECTION_STRING を設定してください。", "error")  
+                flash("ストレージ未設定です。環境変数 AZURE_STORAGE_ACCOUNT_URL を設定してください。", "error")  
                 return redirect(url_for('index'))  
   
             files_list = request.files.getlist('files')  
@@ -1433,7 +1516,6 @@ def index():
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # 画像削除  
         if 'delete_image' in request.form:  
             name = request.form.get('delete_image')  
             if image_container_client and name:  
@@ -1446,7 +1528,6 @@ def index():
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # PDF削除  
         if 'delete_file' in request.form:  
             name = request.form.get('delete_file')  
             if file_container_client and name:  
@@ -1459,7 +1540,6 @@ def index():
             session.modified = True  
             return redirect(url_for('index'))  
   
-        # その他POST  
         return redirect(url_for('index'))  
   
     # --- GET: 描画 ---  
@@ -1468,7 +1548,7 @@ def index():
         for blobname in session.get("image_filenames", []):  
             base = blobname.split("/")[-1]  
             display = base.split("__", 1)[1] if "__" in base else base  
-            url = make_blob_url(image_container_name, blobname)  
+            url = make_blob_url(image_container_name, blobname)  # /view_blob に統一  
             images.append({'name': display, 'blob': blobname, 'url': url})  
   
     files = []  
@@ -1476,7 +1556,7 @@ def index():
         for blobname in session.get("file_filenames", []):  
             base = blobname.split("/")[-1]  
             display = base.split("__", 1)[1] if "__" in base else base  
-            url = make_blob_url(file_container_name, blobname)  
+            url = make_blob_url(file_container_name, blobname)  # /view_blob に統一  
             files.append({'name': display, 'blob': blobname, 'url': url})  
   
     chat_history = session.get("main_chat_messages", [])  
@@ -1525,7 +1605,6 @@ def send_message():
             {'Content-Type': 'application/json'}  
         )  
   
-    # 開始時点のアクティブ会話IDを安定取得  
     active_sid = session.get("current_session_id")  
     if not active_sid:  
         sb = session.get("sidebar_messages", [])  
@@ -1537,14 +1616,12 @@ def send_message():
             start_new_chat()  
             active_sid = session.get("current_session_id")  
   
-    # Cosmos から復元（セッションが空の場合）  
     messages = session.get("main_chat_messages", [])  
     if not messages and container and active_sid:  
         messages = ensure_messages_from_cosmos(active_sid)  
         session["main_chat_messages"] = messages  
         session.modified = True  
   
-    # ユーザメッセージを追加  
     messages.append({"role": "user", "content": prompt, "type": "text"})  
     session["main_chat_messages"] = messages  
     session.modified = True  
@@ -1555,7 +1632,6 @@ def send_message():
         doc_count = max(1, min(300, int(session.get("doc_count", DEFAULT_DOC_COUNT))))  
         rag_enabled = bool(session.get("rag_enabled", True))  
   
-        # system_message は current_session_id から優先取得  
         system_message = session.get("default_system_message", "")  
         sb_for_sys = session.get("sidebar_messages", [])  
         if active_sid:  
@@ -1598,26 +1674,18 @@ def send_message():
             for r in results_list:  
                 title = r.get('title', '不明')  
                 content = r.get('content', '')  
-                fp = (r.get('filepath') or '').replace('\\', '/')  
-                container_name, blobname = (None, None)  
-                if fp:  
-                    container_name, blobname = resolve_blob_from_filepath(selected_index, fp)  
-                else:  
-                    u = r.get('url') or ''  
-                    if is_azure_blob_url(u):  
-                        container_name, blobname = resolve_blob_from_filepath(selected_index, u)  
+                container_name, blobname = resolve_container_blob_from_result(selected_index, r)  
                 url = ''  
                 if container_name and blobname:  
                     try:  
-                        if blobname.lower().endswith('.txt'):  
-                            url = url_for('download_txt', container=container_name, blobname=quote(blobname))  
-                        else:  
-                            blob_client = blob_service_client.get_blob_client(container=container_name, blob=blobname)  
-                            url = generate_sas_url(blob_client, blobname)  
+                        is_text = blobname.lower().endswith('.txt')  
+                        url = build_download_url(container_name, blobname, is_text)  # 常に中継  
                     except Exception as e:  
-                        print("SAS/ダウンロードURL生成エラー:", e)  
-                path_display = fp or (f"{container_name}/{blobname}" if (container_name and blobname) else (r.get('url') or ''))  
-                search_files.append({'title': title, 'content': content, 'url': url, 'filepath': path_display})  
+                        print("ダウンロードURL生成エラー:", e)  
+                        url = url_for('download_blob', container=container_name, blobname=quote(blobname))  
+                path_display = r.get('filepath') or (f"{container_name}/{blobname}" if (container_name and blobname) else (r.get('url') or r.get('metadata_storage_path') or ''))  
+                folder = extract_folder_from_result(selected_index, r)  
+                search_files.append({'title': title, 'content': content, 'url': url, 'filepath': path_display, 'folder': folder})  
         else:  
             queries = []  
             search_files = []  
@@ -1638,6 +1706,7 @@ def send_message():
                     target_user_index = i  
                     break  
   
+        # 画像は data: スキームで添付（SASは使用しない）  
         if target_user_index is not None:  
             image_filenames = session.get("image_filenames", [])  
             for img_blob in image_filenames:  
@@ -1649,13 +1718,16 @@ def send_message():
                     if props.size and props.size > MAX_ATTACHMENT_BYTES:  
                         print(f"画像が大きすぎるため添付スキップ: {img_blob} ({props.size} bytes)")  
                         continue  
-                    sas_url = generate_sas_url(blob_client, img_blob)  
+                    img_b64 = encode_image_from_blob(blob_client)  
+                    ext = os.path.splitext(img_blob)[1].lower()  
+                    mime = "image/png" if ext == ".png" else ("image/gif" if ext == ".gif" else "image/jpeg")  
+                    data_url = f"data:{mime};base64,{img_b64}"  
                     input_items[target_user_index]["content"].append({  
                         "type": "input_image",  
-                        "image_url": sas_url  
+                        "image_url": data_url  
                     })  
                 except Exception as e:  
-                    print("画像添付URL生成エラー:", e)  
+                    print("画像添付Base64生成エラー:", e)  
                     traceback.print_exc()  
   
             file_filenames = session.get("file_filenames", [])  
@@ -1757,7 +1829,6 @@ def stream_message():
     if not prompt:  
         return ("missing prompt", 400, {"Content-Type": "text/plain; charset=utf-8"})  
   
-    # 開始時点のアクティブ会話IDを安定取得  
     active_sid = session.get("current_session_id")  
     if not active_sid:  
         sb = session.get("sidebar_messages", [])  
@@ -1769,7 +1840,6 @@ def stream_message():
             start_new_chat()  
             active_sid = session.get("current_session_id")  
   
-    # Cosmos から復元（セッションが空の場合）  
     messages = session.get("main_chat_messages", [])  
     if not messages and container and active_sid:  
         messages = ensure_messages_from_cosmos(active_sid)  
@@ -1854,26 +1924,18 @@ def stream_message():
                 for r in results_list:  
                     title = r.get('title', '不明')  
                     content = r.get('content', '')  
-                    fp = (r.get('filepath') or '').replace('\\', '/')  
-                    container_name, blobname = (None, None)  
-                    if fp:  
-                        container_name, blobname = resolve_blob_from_filepath(selected_index, fp)  
-                    else:  
-                        u = r.get('url') or ''  
-                        if is_azure_blob_url(u):  
-                            container_name, blobname = resolve_blob_from_filepath(selected_index, u)  
+                    container_name, blobname = resolve_container_blob_from_result(selected_index, r)  
                     url = ''  
                     if container_name and blobname:  
                         try:  
-                            if blobname.lower().endswith('.txt'):  
-                                url = url_for('download_txt', container=container_name, blobname=quote(blobname))  
-                            else:  
-                                blob_client = blob_service_client.get_blob_client(container=container_name, blob=blobname)  
-                                url = generate_sas_url(blob_client, blobname)  
+                            is_text = blobname.lower().endswith('.txt')  
+                            url = build_download_url(container_name, blobname, is_text)  # 常に中継  
                         except Exception as e:  
-                            print("SAS/ダウンロードURL生成エラー:", e)  
-                    path_display = fp or (f"{container_name}/{blobname}" if (container_name and blobname) else (r.get('url') or ''))  
-                    search_files.append({'title': title, 'content': content, 'url': url, 'filepath': path_display})  
+                            print("ダウンロードURL生成エラー:", e)  
+                            url = url_for('download_blob', container=container_name, blobname=quote(blobname))  
+                    path_display = r.get('filepath') or (f"{container_name}/{blobname}" if (container_name and blobname) else (r.get('url') or r.get('metadata_storage_path') or ''))  
+                    folder = extract_folder_from_result(selected_index, r)  
+                    search_files.append({'title': title, 'content': content, 'url': url, 'filepath': path_display, 'folder': folder})  
                 result_holder["search_files"] = search_files  
                 q.put(_sse_event("search_files", search_files))  
             else:  
@@ -1894,7 +1956,7 @@ def stream_message():
                     if input_items[i].get("role") == "user":  
                         target_user_index = i  
                         break  
-  
+            # 画像は data: スキームで添付（SASは使用しない）  
             if target_user_index is not None:  
                 for img_blob in image_filenames:  
                     if not image_container_client:  
@@ -1905,13 +1967,16 @@ def stream_message():
                         if props.size and props.size > MAX_ATTACHMENT_BYTES:  
                             print(f"画像が大きすぎるため添付スキップ: {img_blob} ({props.size} bytes)")  
                             continue  
-                        sas_url = generate_sas_url(blob_client, img_blob)  
+                        img_b64 = encode_image_from_blob(blob_client)  
+                        ext = os.path.splitext(img_blob)[1].lower()  
+                        mime = "image/png" if ext == ".png" else ("image/gif" if ext == ".gif" else "image/jpeg")  
+                        data_url = f"data:{mime};base64,{img_b64}"  
                         input_items[target_user_index]["content"].append({  
                             "type": "input_image",  
-                            "image_url": sas_url  
+                            "image_url": data_url  
                         })  
                     except Exception as e:  
-                        print("画像添付URL生成エラー:", e)  
+                        print("画像添付Base64生成エラー:", e)  
                         traceback.print_exc()  
   
                 for pdf_blob in file_filenames:  
@@ -1967,7 +2032,6 @@ def stream_message():
                         q.put(_sse_event("delta", {"text": final_text}))  
                 except Exception as e:  
                     print("final_response からの出力抽出失敗:", e)  
-  
             result_holder["reasoning_summary"] = extract_reasoning_summary(final_response)  
             full_text = result_holder["full_text"]  
             assistant_html = markdown2.markdown(  
@@ -1990,7 +2054,6 @@ def stream_message():
                     print("RAGAS SSE error:", e)  
   
             q.put(_sse_event("final", {"html": assistant_html, "session_id": active_sid}))  
-  
             try:  
                 persist_assistant_message(  
                     active_sid=active_sid,  
@@ -2002,7 +2065,6 @@ def stream_message():
                 result_holder["persisted"] = True  
             except Exception as e:  
                 print("producer 内の履歴保存エラー（保険）:", e)  
-  
         except Exception as e:  
             print("SSE producer エラー:", e)  
             traceback.print_exc()  
@@ -2052,32 +2114,106 @@ def stream_message():
     }  
     return app.response_class(stream_with_context(generate()), headers=headers)  
   
-# ------------------------------- テキスト Blob ダウンロード -------------------------------  
+# ------------------------------- テキスト Blob ダウンロード（attachment） -------------------------------  
 @app.route("/download_txt/<container>/<path:blobname>")  
 def download_txt(container, blobname):  
     if not blob_service_client:  
         return ("Blob service not configured", 500)  
-    blobname = unquote(blobname)  
-    blob_client = blob_service_client.get_blob_client(container=container, blob=blobname)  
-    txt_bytes = blob_client.download_blob().readall()  
+  
+    # 受け側は最大2回 unquote で正規化  
+    blobname = normalize_blobname(blobname)  
+  
+    # バリデーションは try の外で実行（abort を捕捉しない）  
+    validate_container_and_path(container, blobname)  
+  
     try:  
-        txt_str = txt_bytes.decode("utf-8")  
-    except UnicodeDecodeError:  
-        txt_str = txt_bytes.decode("cp932", errors="ignore")  
-    bom = b'\xef\xbb\xbf'  
-    buf = io.BytesIO(bom + txt_str.encode("utf-8"))  
-    filename = os.path.basename(blobname)  
-    ascii_filename = "download.txt"  
-    response = send_file(  
-        buf,  
-        as_attachment=True,  
-        download_name=ascii_filename,  
-        mimetype="text/plain; charset=utf-8"  
-    )  
-    response.headers["Content-Disposition"] = (  
-        f'attachment; filename="{ascii_filename}"; filename*=UTF-8\'\'{quote(filename)}'  
-    )  
-    return response  
+        bc = blob_service_client.get_blob_client(container=container, blob=blobname)  
+        txt_bytes = bc.download_blob().readall()  
+        try:  
+            txt_str = txt_bytes.decode("utf-8")  
+        except UnicodeDecodeError:  
+            txt_str = txt_bytes.decode("cp932", errors="ignore")  
+        bom = b'\xef\xbb\xbf'  
+        buf = io.BytesIO(bom + txt_str.encode("utf-8"))  
+        filename = os.path.basename(blobname)  
+        ascii_filename = "download.txt"  
+        response = send_file(  
+            buf,  
+            as_attachment=True,  
+            download_name=ascii_filename,  
+            mimetype="text/plain; charset=utf-8"  
+        )  
+        response.headers["Content-Disposition"] = (  
+            f'attachment; filename="{ascii_filename}"; filename*=UTF-8\'\'{quote(filename)}'  
+        )  
+        return response  
+    except ResourceNotFoundError:  
+        return ("Not Found", 404)  
+    except ClientAuthenticationError:  
+        return ("Forbidden", 403)  
+    except HttpResponseError as e:  
+        print("Blob download_txt error:", e)  
+        return (f"Blob download error: {e}", 502)  
+    except Exception as e:  
+        print("Unexpected blob download_txt error:", e)  
+        traceback.print_exc()  
+        return (f"Unexpected error: {e}", 500)  
+  
+# ------------------------------- バイナリ Blob ダウンロード（attachment） -------------------------------  
+@app.route("/download_blob/<container>/<path:blobname>")  
+def download_blob(container, blobname):  
+    if not blob_service_client:  
+        return ("Blob service not configured", 500)  
+  
+    # 受け側は最大2回 unquote で正規化  
+    blobname = normalize_blobname(blobname)  
+  
+    # バリデーションは try の外で実行（abort を捕捉しない）  
+    validate_container_and_path(container, blobname)  
+  
+    try:  
+        bc = blob_service_client.get_blob_client(container=container, blob=blobname)  
+        data = bc.download_blob().readall()  
+        filename = os.path.basename(blobname)  
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"  
+        return send_file(io.BytesIO(data), as_attachment=True, download_name=filename, mimetype=content_type)  
+    except ResourceNotFoundError:  
+        return ("Not Found", 404)  
+    except ClientAuthenticationError:  
+        return ("Forbidden", 403)  
+    except HttpResponseError as e:  
+        print("Blob download error:", e)  
+        return (f"Blob download error: {e}", 502)  
+    except Exception as e:  
+        print("Unexpected blob download error:", e)  
+        traceback.print_exc()  
+        return (f"Unexpected error: {e}", 500)  
+  
+# ------------------------------- Blob inline 表示（画像/PDF等） -------------------------------  
+@app.route("/view_blob/<container>/<path:blobname>")  
+def view_blob(container, blobname):  
+    if not blob_service_client:  
+        return ("Blob service not configured", 500)  
+  
+    blobname = normalize_blobname(blobname)  
+    validate_container_and_path(container, blobname)  
+  
+    try:  
+        bc = blob_service_client.get_blob_client(container=container, blob=blobname)  
+        data = bc.download_blob().readall()  
+        content_type = mimetypes.guess_type(blobname)[0] or "application/octet-stream"  
+        return send_file(io.BytesIO(data), as_attachment=False, download_name=os.path.basename(blobname), mimetype=content_type)  
+    except ResourceNotFoundError:  
+        return ("Not Found", 404)  
+    except ClientAuthenticationError:  
+        return ("Forbidden", 403)  
+    except HttpResponseError as e:  
+        print("Blob view error:", e)  
+        return (f"Blob view error: {e}", 502)  
+    except Exception as e:  
+        print("Unexpected blob view error:", e)  
+        traceback.print_exc()  
+        return (f"Unexpected error: {e}", 500)  
   
 # ------------------------------- エントリポイント -------------------------------  
 if __name__ == '__main__':  
