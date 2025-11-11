@@ -56,10 +56,6 @@ from openai import AzureOpenAI
 import markdown2  
 from azure.identity import AzureCliCredential, ManagedIdentityCredential  
   
-# 必要な環境でプロキシを使用  
-os.environ['HTTP_PROXY'] = os.getenv('HTTP_PROXY', 'http://g3.konicaminolta.jp:8080')  
-os.environ['HTTPS_PROXY'] = os.getenv('HTTPS_PROXY', 'http://g3.konicaminolta.jp:8080')  
-  
 # RAGAS（任意依存; 未インストールでもOK）  
 try:  
     from datasets import Dataset  
