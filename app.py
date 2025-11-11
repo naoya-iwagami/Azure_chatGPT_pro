@@ -45,9 +45,6 @@ from flask import copy_current_request_context
 from flask_session import Session  
 from werkzeug.utils import secure_filename  
   
-import certifi  
-from azure.core.pipeline.transport import RequestsTransport  
-from azure.core.pipeline.policies import RetryPolicy  
 from azure.core.exceptions import ResourceNotFoundError, ClientAuthenticationError, HttpResponseError  
 from azure.search.documents import SearchClient  
 from azure.cosmos import CosmosClient  
@@ -164,8 +161,7 @@ else:
 blob_account_url = os.getenv("AZURE_STORAGE_ACCOUNT_URL")  
 blob_service_client = BlobServiceClient(  
     account_url=blob_account_url,  
-    credential=credential,  
-    transport=transport  
+    credential=credential  
 ) if blob_account_url else None  
   
 image_container_name = 'chatgpt-image'  
@@ -874,8 +870,6 @@ def get_search_client(index_name):
         endpoint=search_service_endpoint,  
         index_name=index_name,  
         credential=credential,  
-        transport=transport,  
-        retry_policy=retry_policy,  
         api_version="2024-07-01",  
     )  
   
