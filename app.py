@@ -84,34 +84,6 @@ Session(app)
 # この版ではSASは使用せず、常に中継を使用するため、この設定値に関わらず中継を使います。  
 USE_SAS_LINKS = os.getenv("USE_SAS_LINKS", "true" if IS_LOCAL else "false").lower() == "true"  
   
-# ------------------------------- 共通 RequestsTransport/Retry 設定 -------------------------------  
-def _build_requests_transport():  
-    proxies = {}  
-    http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")  
-    https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")  
-    if http_proxy:  
-        proxies["http"] = http_proxy  
-    if https_proxy:  
-        proxies["https"] = https_proxy  
-    verify_path = os.getenv("REQUESTS_CA_BUNDLE") or os.getenv("AZURE_CA_BUNDLE") or certifi.where()  
-    conn_timeout = int(os.getenv("AZURE_HTTP_CONN_TIMEOUT", "20"))  
-    read_timeout = int(os.getenv("AZURE_HTTP_READ_TIMEOUT", "120"))  
-    return RequestsTransport(  
-        connection_verify=verify_path,  
-        proxies=proxies or None,  
-        connection_timeout=conn_timeout,  
-        read_timeout=read_timeout,  
-    )  
-  
-transport = _build_requests_transport()  
-retry_policy = RetryPolicy(  
-    retry_total=int(os.getenv("AZURE_RETRY_TOTAL", "5")),  
-    retry_connect=3,  
-    retry_read=3,  
-    retry_status=3,  
-    retry_backoff_factor=float(os.getenv("AZURE_RETRY_BACKOFF", "0.8")),  
-)  
-  
 # ------------------------------- Azure Identity 認証 -------------------------------  
 def build_credential():  
     if IS_LOCAL:  
