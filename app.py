@@ -2,13 +2,6 @@
 # -*- coding: utf-8 -*-  
 """  
 PM Compass PRO – Flask アプリ（Entra ID 認証版）  
-  
-修正点:  
-- RAGAS を 0.2 系で利用するように変更  
-- llm_factory / InstructorLLM / patch_ragas_llm_async を廃止し、  
-  LangChain ベース (LangchainLLMWrapper / LangchainEmbeddingsWrapper + AzureChatOpenAI) に変更  
-- RAGAS の context_precision / context_recall 用に reference 列を使うロジックは維持  
-- RAGAS スコアを CosmosDB 保存前に NaN/Inf サニタイズします。  
 """  
   
 import os  
@@ -51,22 +44,6 @@ from openai import AzureOpenAI
 import markdown2  
 from azure.identity import AzureCliCredential, ManagedIdentityCredential  
   
-# RAGAS（任意依存; 未インストールでもOK） - 0.2 系用  
-try:  
-    from datasets import Dataset  
-    from ragas import evaluate  
-    from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall  
-    # ここを Wrapper に変更  
-    from ragas.llms import LangchainLLMWrapper  
-    from ragas.embeddings import LangchainEmbeddingsWrapper  
-    from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings  
-  
-    RAGAS_AVAILABLE = True  
-    print("★RAGAS: Import success (v0.2.x mode)")  
-except Exception as e:  
-    print(f"★RAGAS import failed: {e}")  
-    RAGAS_AVAILABLE = False  
-  
 # プロキシ  
 os.environ['HTTP_PROXY'] = 'http://g3.konicaminolta.jp:8080'  
 os.environ['HTTPS_PROXY'] = 'http://g3.konicaminolta.jp:8080'  
@@ -105,9 +82,9 @@ def build_azure_ad_token_provider(credential, scope):
 aad_token_provider = build_azure_ad_token_provider(credential, "https://cognitiveservices.azure.com/.default")  
   
 # ------------------------------- Azure OpenAI クライアント設定（AAD） -------------------------------  
-# メインの Responses API クライアント  
+# メインの Responses API クライアント（Entra ID 認証）  
 client = AzureOpenAI(  
-    base_url=os.getenv("AZURE_OPENAI_ENDPOINT"),  
+    base_url=os.getenv("AZURE_OPENAI_ENDPOINT"),  # 例: https://<resource-name>.openai.azure.com/openai/v1  
     api_version="v1",  
     azure_ad_token_provider=aad_token_provider,  
     default_headers={"x-ms-include-response-reasoning-summary": "true"},  
@@ -116,7 +93,7 @@ client = AzureOpenAI(
 # 埋め込み用クライアント  
 embed_endpoint = os.getenv("AZURE_OPENAI_EMBED_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")  
 embed_client = AzureOpenAI(  
-    azure_endpoint=embed_endpoint,  
+    azure_endpoint=embed_endpoint,                # 例: https://<resource-name>.openai.azure.com  
     api_version="2025-04-01-preview",  
     azure_ad_token_provider=aad_token_provider,  
 )  
@@ -148,9 +125,6 @@ MIN_UNIQUE_PARENTS_ABS = int(os.getenv("MIN_UNIQUE_PARENTS_ABS", "3"))
   
 # 添付の最大バイト（超過時は添付スキップ）  
 MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(5 * 1024 * 1024)))  # 5MB  
-  
-# RAGAS フラグ  
-ENABLE_RAGAS = os.getenv("ENABLE_RAGAS", "1") not in ("0", "false", "False")  
   
 # ------------------------------- Azure サービスクライアント（AAD） -------------------------------  
 search_service_endpoint = os.getenv("AZURE_SEARCH_ENDPOINT")  
@@ -611,28 +585,18 @@ def merge_messages(existing: list, new: list) -> list:
             merged.append(m)  
     return merged  
   
-def persist_assistant_message(active_sid: str, assistant_html: str, full_text: str, ragas_scores: dict, system_message: str):  
+def persist_assistant_message(active_sid: str, assistant_html: str, full_text: str, system_message: str):  
     if not active_sid:  
         return  
   
     existing_msgs = ensure_messages_from_cosmos(active_sid)  
     session_msgs = session.get("main_chat_messages", [])  
-    # RAGASスコアのNaN/Infサニタイズ保険（念のため）  
-    safe_ragas = {}  
-    try:  
-        for k, v in (ragas_scores or {}).items():  
-            f = float(v)  
-            if math.isfinite(f):  
-                safe_ragas[k] = f  
-    except Exception:  
-        pass  
   
     candidate_msgs = (session_msgs or []) + [{  
         "role": "assistant",  
         "content": assistant_html,  
         "type": "html",  
         "text": full_text,  
-        "ragas": safe_ragas or {}  
     }]  
     merged_msgs = merge_messages(existing_msgs, candidate_msgs)  
   
@@ -1069,187 +1033,6 @@ def refine_query_with_prf(initial_query: str, titles: list) -> str:
 def unique_parents(results):  
     return len({(r.get("parent_id") or r.get("filepath") or r.get("title")) for r in (results or [])})  
   
-# ------------------------------- RAGAS -------------------------------  
-RAGAS_LLM_WRAPPER = None  
-RAGAS_EMB_WRAPPER = None  
-  
-def init_ragas_clients():  
-    """  
-    RAGAS 0.2 系用クライアント初期化  
-    - LangChain の AzureChatOpenAI / AzureOpenAIEmbeddings を使う  
-    - まず AAD(azure_ad_token_provider) で試し、TypeError 等なら APIキーにフォールバック  
-    - RAGAS 用に Chat Completions API のエンドポイントを AZURE_OPENAI_RAGAS_ENDPOINT で指定可能  
-      （未設定の場合は AZURE_OPENAI_ENDPOINT を使用）  
-    """  
-    global RAGAS_LLM_WRAPPER, RAGAS_EMB_WRAPPER  
-    print("★RAGAS: init_ragas_clients called")  
-  
-    if RAGAS_LLM_WRAPPER and RAGAS_EMB_WRAPPER:  
-        return RAGAS_LLM_WRAPPER, RAGAS_EMB_WRAPPER  
-    if not RAGAS_AVAILABLE:  
-        print("★RAGAS: RAGAS_AVAILABLE is False")  
-        return None, None  
-  
-    # RAGAS 用 Chat Completions エンドポイント（Responses API 用とは別に指定可能）  
-    azure_endpoint = os.getenv("AZURE_OPENAI_RAGAS_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")  
-    # Embedding は共通のエンドポイントを使用（指定があれば優先）  
-    embed_ep = os.getenv("AZURE_OPENAI_EMBED_ENDPOINT") or azure_endpoint  
-  
-    judge_deploy = os.getenv("AZURE_OPENAI_RAGAS_JUDGE_DEPLOYMENT") or os.getenv("AZURE_OPENAI_RESPONSES_MODEL", "gpt-4o")  
-    embed_deploy = os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT", EMBEDDING_MODEL)  
-  
-    chat_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")  
-    embed_api_version = os.getenv("AZURE_OPENAI_EMBED_API_VERSION", "2024-02-15-preview")  
-  
-    print("★RAGAS: endpoint =", azure_endpoint)  
-    print("★RAGAS: judge_deploy =", judge_deploy)  
-    print("★RAGAS: embed_endpoint =", embed_ep)  
-    print("★RAGAS: embed_deploy =", embed_deploy)  
-    print("★RAGAS: chat_api_version =", chat_api_version)  
-    print("★RAGAS: embed_api_version =", embed_api_version)  
-  
-    try:  
-        # AAD 認証で LangChain LLM/Embedding を作成  
-        chat_llm = AzureChatOpenAI(  
-            azure_endpoint=azure_endpoint,  
-            azure_ad_token_provider=aad_token_provider,  
-            api_version=chat_api_version,  
-            azure_deployment=judge_deploy,  
-            temperature=0.0,  
-        )  
-        embed_model = AzureOpenAIEmbeddings(  
-            azure_endpoint=embed_ep,  
-            azure_ad_token_provider=aad_token_provider,  
-            api_version=embed_api_version,  
-            azure_deployment=embed_deploy,  
-        )  
-        # Wrapper を利用  
-        llm = LangchainLLMWrapper(chat_llm)  
-        emb = LangchainEmbeddingsWrapper(embed_model)  
-        print("★RAGAS: Client created successfully (LangChain + AzureChatOpenAI + AAD)")  
-    except TypeError as e:  
-        # AAD パラメータがサポートされない場合など  
-        print(f"★RAGAS Init AAD Error: {e}")  
-        api_key = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")  
-        if not api_key:  
-            print("★RAGAS Init Error: APIキー未設定のため RAGAS を無効化します")  
-            return None, None  
-        try:  
-            chat_llm = AzureChatOpenAI(  
-                azure_endpoint=azure_endpoint,  
-                api_key=api_key,  
-                api_version=chat_api_version,  
-                azure_deployment=judge_deploy,  
-                temperature=0.0,  
-            )  
-            embed_model = AzureOpenAIEmbeddings(  
-                azure_endpoint=embed_ep,  
-                api_key=api_key,  
-                api_version=embed_api_version,  
-                azure_deployment=embed_deploy,  
-            )  
-            # Wrapper を利用  
-            llm = LangchainLLMWrapper(chat_llm)  
-            emb = LangchainEmbeddingsWrapper(embed_model)  
-            print("★RAGAS: Client created successfully (LangChain + AzureChatOpenAI + API key)")  
-        except Exception as e2:  
-            print(f"★RAGAS Init Fallback Error: {e2}")  
-            return None, None  
-    except Exception as e:  
-        print(f"★RAGAS Init Unknown Error: {e}")  
-        return None, None  
-  
-    RAGAS_LLM_WRAPPER = llm  
-    RAGAS_EMB_WRAPPER = emb  
-    return RAGAS_LLM_WRAPPER, RAGAS_EMB_WRAPPER  
-  
-def compute_ragas_metrics(question: str, contexts: list, answer: str) -> dict:  
-    print("★RAGAS: compute_ragas_metrics called")  
-    try:  
-        if not ENABLE_RAGAS or not RAGAS_AVAILABLE:  
-            print("★RAGAS: Disabled or Not Available")  
-            return {}  
-        if not answer or not question:  
-            return {}  
-  
-        llm, emb = init_ragas_clients()  
-        if not llm or not emb:  
-            return {}  
-  
-        # 入力整形  
-        ctxs = [c for c in (contexts or []) if isinstance(c, str) and c.strip()]  
-  
-        # 疑似 reference の使用可否（contexts を連結して reference とみなす）  
-        use_ctx_as_ref = os.getenv("RAGAS_USE_CONTEXT_AS_REFERENCE", "0").lower() not in ("0", "false", "")  
-        reference_text = None  
-        if use_ctx_as_ref and ctxs:  
-            reference_text = "\n".join(ctxs)[:50000]  
-  
-        # 使用するメトリクスを選択  
-        metrics = [answer_relevancy]           # 参照不要  
-        if ctxs:  
-            metrics.append(faithfulness)       # 参照不要（コンテキストは必要）  
-        if reference_text:  
-            metrics.extend([context_precision, context_recall])  
-  
-        # Dataset 構築  
-        ds_dict = {  
-            "question": [question],  
-            "answer": [answer],  
-            "contexts": [ctxs],  
-        }  
-        if reference_text:  
-            ds_dict["ground_truth"] = [reference_text]  
-        ds = Dataset.from_dict(ds_dict)  
-  
-        print("★RAGAS: Starting evaluate()... metrics=",  
-              [getattr(m, "name", m.__class__.__name__) for m in metrics])  
-        result = evaluate(ds, metrics=metrics, llm=llm, embeddings=emb)  
-  
-        # 生の result.scores を確認  
-        raw_scores = getattr(result, "scores", None)  
-        print("★RAGAS: raw result.scores =", raw_scores)  
-  
-        scores = {}  
-  
-        def _add_score(name, val):  
-            try:  
-                f = float(val)  
-                if math.isfinite(f):  
-                    scores[name] = round(f, 4)  
-                else:  
-                    print(f"★RAGAS: drop non-finite score {name}={val}")  
-            except Exception:  
-                print(f"★RAGAS: drop non-numeric score {name}={val}")  
-  
-        # 1. result.scores を優先的に利用  
-        if isinstance(raw_scores, dict):  
-            for name, val in raw_scores.items():  
-                # ragas 0.2 系では list になっていることが多い  
-                if isinstance(val, list):  
-                    val = val[0] if val else None  
-                if val is not None:  
-                    _add_score(name, val)  
-  
-        # 2. 念のため DataFrame からも拾う（上で何も取れなかった場合に備えた保険）  
-        if not scores and hasattr(result, "to_pandas"):  
-            try:  
-                df = result.to_pandas()  
-                print("★RAGAS: result.to_pandas() =\n", df)  
-                if len(df) > 0:  
-                    row = df.iloc[0]  
-                    for col in df.columns:  
-                        _add_score(col, row[col])  
-            except Exception as e:  
-                print("★RAGAS: to_pandas() parse error:", e)  
-  
-        print("★RAGAS: final sanitized scores =", scores)  
-        return scores  
-    except Exception as e:  
-        print("RAGAS evaluate error:", e)  
-        traceback.print_exc()  
-        return {}  
-  
 # ------------------------------- Responses 入力構築 -------------------------------  
 def build_responses_input_with_history(  
     all_messages,  
@@ -1679,7 +1462,13 @@ def send_message():
     prompt = (data.get('prompt') or '').strip()  
     if not prompt:  
         return (  
-            json.dumps({'response': '', 'search_files': [], 'reasoning_summary': '', 'rewritten_queries': [], 'ragas': {}, 'session_id': session.get("current_session_id", "")}),  
+            json.dumps({  
+                'response': '',  
+                'search_files': [],  
+                'reasoning_summary': '',  
+                'rewritten_queries': [],  
+                'session_id': session.get("current_session_id", "")  
+            }),  
             400,  
             {'Content-Type': 'application/json'}  
         )  
@@ -1847,18 +1636,10 @@ def send_message():
         ) or "<p>（応答テキストが空でした。もう一度お試しください）</p>"  
         reasoning_summary = extract_reasoning_summary(response)  
   
-        ragas_scores = {}  
-        try:  
-            contexts_for_eval = [sf.get("content", "") for sf in (search_files or []) if isinstance(sf.get("content"), str)]  
-            ragas_scores = compute_ragas_metrics(prompt, contexts_for_eval, output_text)  
-        except Exception as e:  
-            print("RAGAS compute error:", e)  
-  
         persist_assistant_message(  
             active_sid=active_sid,  
             assistant_html=assistant_html,  
             full_text=output_text,  
-            ragas_scores=ragas_scores,  
             system_message=system_message  
         )  
   
@@ -1868,7 +1649,6 @@ def send_message():
                 'search_files': search_files,  
                 'reasoning_summary': reasoning_summary,  
                 'rewritten_queries': queries,  
-                'ragas': ragas_scores,  
                 'session_id': active_sid  
             }),  
             200,  
@@ -1884,7 +1664,6 @@ def send_message():
                 'search_files': [],  
                 'reasoning_summary': '',  
                 'rewritten_queries': [],  
-                'ragas': {},  
                 'session_id': active_sid  
             }),  
             500,  
@@ -1962,9 +1741,7 @@ def stream_message():
         "assistant_html": "",  
         "reasoning_summary": "",  
         "search_files": [],  
-        "error": None,  
-        "ragas_scores": {},  
-        "persisted": False  
+        "error": None  
     }  
   
     @copy_current_request_context  
@@ -2122,29 +1899,7 @@ def stream_message():
             if result_holder["reasoning_summary"]:  
                 q.put(_sse_event("reasoning_summary", {"summary": result_holder["reasoning_summary"]}))  
   
-            if ENABLE_RAGAS and RAGAS_AVAILABLE and result_holder["full_text"]:  
-                try:  
-                    contexts = [sf.get("content", "") for sf in (result_holder.get("search_files") or []) if isinstance(sf.get("content"), str)]  
-                    ragas_scores = compute_ragas_metrics(prompt, contexts, result_holder["full_text"])  
-                    result_holder["ragas_scores"] = ragas_scores  
-                    if ragas_scores:  
-                        q.put(_sse_event("ragas_metrics", ragas_scores))  
-                except Exception as e:  
-                    print("RAGAS SSE error:", e)  
-  
             q.put(_sse_event("final", {"html": assistant_html, "session_id": active_sid}))  
-  
-            try:  
-                persist_assistant_message(  
-                    active_sid=active_sid,  
-                    assistant_html=assistant_html,  
-                    full_text=result_holder["full_text"],  
-                    ragas_scores=result_holder.get("ragas_scores", {}),  
-                    system_message=system_message  
-                )  
-                result_holder["persisted"] = True  
-            except Exception as e:  
-                print("producer 内の履歴保存エラー（保険）:", e)  
         except Exception as e:  
             print("SSE producer エラー:", e)  
             traceback.print_exc()  
@@ -2174,12 +1929,11 @@ def stream_message():
                 break  
             yield chunk  
         try:  
-            if (result_holder["assistant_html"] or result_holder["full_text"]) and not result_holder.get("persisted"):  
+            if result_holder["assistant_html"] or result_holder["full_text"]:  
                 persist_assistant_message(  
                     active_sid=active_sid,  
                     assistant_html=result_holder["assistant_html"],  
                     full_text=result_holder["full_text"],  
-                    ragas_scores=result_holder.get("ragas_scores", {}),  
                     system_message=system_message  
                 )  
         except Exception as e:  

@@ -180,13 +180,3 @@ html, body {
 .rq-list li {  
         margin-bottom: 2px;  
 }  
-  
-/* RAGAS メトリクス表示 */  
-.ragas-metrics {  
-        font-size: 0.85em;  
-        background: #eef7ee;  
-        border-left: 4px solid #3c763d;  
-        padding: 6px 10px;  
-        border-radius: 6px;  
-        margin-top: 6px;  
-}  

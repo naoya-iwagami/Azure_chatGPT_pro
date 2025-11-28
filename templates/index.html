@@ -257,15 +257,6 @@
                 {% else %}  
                   <p>{{ msg.content|e }}</p>  
                 {% endif %}  
-                {% if msg.ragas %}  
-                  <div class="ragas-metrics alert alert-secondary" style="font-size:0.85em; margin-top:6px;">  
-                    <strong>RAGAS OK評価結果（GTなし）</strong><br>  
-                    Faithfulness: {{ (msg.ragas.faithfulness * 100)|round(1) if msg.ragas.faithfulness is defined else '-' }}%<br>  
-                    Answer Relevancy: {{ (msg.ragas.answer_relevancy * 100)|round(1) if msg.ragas.answer_relevancy is defined else '-' }}%<br>  
-                    Context Precision: {{ (msg.ragas.context_precision * 100)|round(1) if msg.ragas.context_precision is defined else '-' }}%<br>  
-                    Context Recall: {{ (msg.ragas.context_recall * 100)|round(1) if msg.ragas.context_recall is defined else '-' }}%  
-                  </div>  
-                {% endif %}  
               {% endif %}  
             </div>  
           </div>  
@@ -498,6 +489,7 @@ document.addEventListener('DOMContentLoaded', function() {
   function startSSE(prompt) {  
     const streamEl = appendAssistantStreamContainer();  
     let accText = '';  
+    let finished = false;  // 終了判定フラグ  
   
     sendButton.disabled = true;  
     showLoading();  
@@ -555,27 +547,11 @@ document.addEventListener('DOMContentLoaded', function() {
           }  
         } catch (_) {}  
       });  
-      es.addEventListener('ragas_metrics', ev => {  
-        try {  
-          const data = JSON.parse(ev.data);  
-          const bubble = streamEl.closest('.message-bubble') || streamEl.parentElement;  
-          const wrap = document.createElement('div');  
-          wrap.className = 'ragas-metrics alert alert-secondary';  
-          const fmt = (v) => (typeof v === 'number' ? (v * 100).toFixed(1) + '%' : '-');  
-          wrap.innerHTML =  
-            '<strong>RAGAS OK評価結果（GTなし）</strong><br>' +  
-            'Faithfulness: ' + fmt(data.faithfulness) + '<br>' +  
-            'Answer Relevancy: ' + fmt(data.answer_relevancy) + '<br>' +  
-            'Context Precision: ' + fmt(data.context_precision) + '<br>' +  
-            'Context Recall: ' + fmt(data.context_recall);  
-          bubble.appendChild(wrap);  
-          scrollChatToBottom();  
-        } catch (_) {}  
-      });  
       es.addEventListener('error', ev => {  
         try { console.error('SSE error event:', JSON.parse(ev.data)); } catch (_) {}  
       });  
       es.addEventListener('done', ev => {  
+        finished = true;  
         es.close();  
         sendButton.disabled = false;  
         hideLoading();  
@@ -583,6 +559,9 @@ document.addEventListener('DOMContentLoaded', function() {
       });  
       es.onerror = function(err) {  
         console.error('SSE connection error:', err);  
+        if (finished) {  
+          return;  
+        }  
         es.close();  
         sendButton.disabled = false;  
         hideLoading();  
@@ -637,20 +616,6 @@ document.addEventListener('DOMContentLoaded', function() {
         renderSearchFiles(data.search_files);  
       } else {  
         clearSearchFilesDisplay();  
-      }  
-  
-      // ここを追加: /send_message の ragas を表示  
-      if (bubbleEl && data.ragas && typeof data.ragas === 'object') {  
-        const wrap = document.createElement('div');  
-        wrap.className = 'ragas-metrics alert alert-secondary';  
-        const fmt = (v) => (typeof v === 'number' ? (v * 100).toFixed(1) + '%' : '-');  
-        wrap.innerHTML =  
-          '<strong>RAGAS OK評価結果（GTなし）</strong><br>' +  
-          'Faithfulness: ' + fmt(data.ragas.faithfulness) + '<br>' +  
-          'Answer Relevancy: ' + fmt(data.ragas.answer_relevancy) + '<br>' +  
-          'Context Precision: ' + fmt(data.ragas.context_precision) + '<br>' +  
-          'Context Recall: ' + fmt(data.ragas.context_recall);  
-        bubbleEl.appendChild(wrap);  
       }  
     })  
     .catch(e => {  
