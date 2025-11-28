@@ -43,6 +43,7 @@ from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPerm
 from openai import AzureOpenAI  
 import markdown2  
 from azure.identity import AzureCliCredential, ManagedIdentityCredential  
+
   
 # ------------------------------- アプリ環境/Flask -------------------------------  
 APP_ENV = os.getenv("APP_ENV", "prod").lower()  
