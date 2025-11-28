@@ -44,10 +44,6 @@ from openai import AzureOpenAI
 import markdown2  
 from azure.identity import AzureCliCredential, ManagedIdentityCredential  
   
-# プロキシ  
-os.environ['HTTP_PROXY'] = 'http://g3.konicaminolta.jp:8080'  
-os.environ['HTTPS_PROXY'] = 'http://g3.konicaminolta.jp:8080'  
-  
 # ------------------------------- アプリ環境/Flask -------------------------------  
 APP_ENV = os.getenv("APP_ENV", "prod").lower()  
 IS_LOCAL = APP_ENV == "local"  
