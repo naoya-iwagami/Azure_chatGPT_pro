@@ -263,7 +263,7 @@
                     Faithfulness: {{ (msg.ragas.faithfulness * 100)|round(1) if msg.ragas.faithfulness is defined else '-' }}%<br>  
                     Answer Relevancy: {{ (msg.ragas.answer_relevancy * 100)|round(1) if msg.ragas.answer_relevancy is defined else '-' }}%<br>  
                     Context Precision: {{ (msg.ragas.context_precision * 100)|round(1) if msg.ragas.context_precision is defined else '-' }}%<br>  
-                    Context Relevancy: {{ (msg.ragas.context_relevancy * 100)|round(1) if msg.ragas.context_relevancy is defined else '-' }}  
+                    Context Recall: {{ (msg.ragas.context_recall * 100)|round(1) if msg.ragas.context_recall is defined else '-' }}%  
                   </div>  
                 {% endif %}  
               {% endif %}  
@@ -428,7 +428,7 @@ document.addEventListener('DOMContentLoaded', function() {
     currentSearchFiles = [];  
   }  
   
-  // ここを修正: ファイル名の右側に「フォルダ名」だけを表示（重複回避）  
+  // ファイル名の右側にフォルダ名表示  
   function renderSearchFiles(files) {  
     if (!Array.isArray(files) || files.length === 0) {  
       clearSearchFilesDisplay();  
@@ -440,7 +440,6 @@ document.addEventListener('DOMContentLoaded', function() {
     let title = `<span id="searchFilesToggle" style="cursor:pointer; text-decoration:underline;">この質問で検索に利用された文書</span>`;  
     let ul = `<div id="searchFilesUlContainer" style="display:none;" tabindex="0"><ul>`;  
     files.forEach((file, idx) => {  
-      // アプリ内ルート（/download_*）はエンコード不要。外部URL（SAS等）のみ encodeURI  
       let safeHref = '';  
       if (typeof file?.url === 'string') {  
         safeHref = file.url.startsWith('/download_') ? file.url : encodeURI(file.url);  
@@ -568,7 +567,7 @@ document.addEventListener('DOMContentLoaded', function() {
             'Faithfulness: ' + fmt(data.faithfulness) + '<br>' +  
             'Answer Relevancy: ' + fmt(data.answer_relevancy) + '<br>' +  
             'Context Precision: ' + fmt(data.context_precision) + '<br>' +  
-            'Context Relevancy: ' + fmt(data.context_relevancy);  
+            'Context Recall: ' + fmt(data.context_recall);  
           bubble.appendChild(wrap);  
           scrollChatToBottom();  
         } catch (_) {}  
@@ -614,6 +613,7 @@ document.addEventListener('DOMContentLoaded', function() {
         renderRewrittenQueriesUnder(lastUserBubbleEl, { queries: data.rewritten_queries });  
       }  
       let assistantEl = null;  
+      let bubbleEl = null;  
       if (data.response) {  
         const c = document.createElement('div');  
         c.className = 'message-container assistant';  
@@ -623,6 +623,7 @@ document.addEventListener('DOMContentLoaded', function() {
           </div>`;  
         chatBox.appendChild(c);  
         assistantEl = c.querySelector('.assistant-message');  
+        bubbleEl = c.querySelector('.message-bubble');  
   
         const t = extractTitleFromHtml(data.response, 10);  
         const sid = data.session_id || (document.getElementById('currentSession')?.dataset.sessionId || '');  
@@ -636,6 +637,20 @@ document.addEventListener('DOMContentLoaded', function() {
         renderSearchFiles(data.search_files);  
       } else {  
         clearSearchFilesDisplay();  
+      }  
+  
+      // ここを追加: /send_message の ragas を表示  
+      if (bubbleEl && data.ragas && typeof data.ragas === 'object') {  
+        const wrap = document.createElement('div');  
+        wrap.className = 'ragas-metrics alert alert-secondary';  
+        const fmt = (v) => (typeof v === 'number' ? (v * 100).toFixed(1) + '%' : '-');  
+        wrap.innerHTML =  
+          '<strong>RAGAS OK評価結果（GTなし）</strong><br>' +  
+          'Faithfulness: ' + fmt(data.ragas.faithfulness) + '<br>' +  
+          'Answer Relevancy: ' + fmt(data.ragas.answer_relevancy) + '<br>' +  
+          'Context Precision: ' + fmt(data.ragas.context_precision) + '<br>' +  
+          'Context Recall: ' + fmt(data.ragas.context_recall);  
+        bubbleEl.appendChild(wrap);  
       }  
     })  
     .catch(e => {  
