@@ -42,8 +42,7 @@ from azure.cosmos import CosmosClient
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions  
 from openai import AzureOpenAI  
 import markdown2  
-from azure.identity import AzureCliCredential, ManagedIdentityCredential  
-
+from azure.identity import AzureCliCredential, ManagedIdentityCredential    
   
 # ------------------------------- アプリ環境/Flask -------------------------------  
 APP_ENV = os.getenv("APP_ENV", "prod").lower()  
@@ -128,15 +127,18 @@ search_service_endpoint = os.getenv("AZURE_SEARCH_ENDPOINT")
   
 cosmos_endpoint = os.getenv("AZURE_COSMOS_ENDPOINT")  
 database_name = 'chatdb'  
-container_name = 'personalchats'  
+container_name = 'personalchats'       # チャット履歴用  
+system_prompt_container_name = 'systemprompts_1'  # ★ システムプロンプト用  
   
 cosmos_client = CosmosClient(cosmos_endpoint, credential=credential) if cosmos_endpoint else None  
 if cosmos_client:  
     database = cosmos_client.get_database_client(database_name)  
     container = database.get_container_client(container_name)  
+    system_prompt_container = database.get_container_client(system_prompt_container_name)  
 else:  
     database = None  
     container = None  
+    system_prompt_container = None  
   
 blob_account_url = os.getenv("AZURE_STORAGE_ACCOUNT_URL")  
 blob_service_client = BlobServiceClient(  
@@ -396,11 +398,11 @@ def resolve_blob_from_filepath(selected_index: str, path_or_url: str):
         except Exception:  
             return None, None  
     # 相対パス  
-    container = INDEX_TO_BLOB_CONTAINER.get(selected_index, DEFAULT_BLOB_CONTAINER_FOR_SEARCH)  
+    container_name2 = INDEX_TO_BLOB_CONTAINER.get(selected_index, DEFAULT_BLOB_CONTAINER_FOR_SEARCH)  
     blobname = unquote(s.lstrip("/"))  
-    if container and blobname.startswith(container + "/"):  
-        blobname = blobname[len(container) + 1:]  
-    return container, blobname  
+    if container_name2 and blobname.startswith(container_name2 + "/"):  
+        blobname = blobname[len(container_name2) + 1:]  
+    return container_name2, blobname  
   
 def resolve_container_blob_from_result(selected_index: str, result):  
     """  
@@ -429,7 +431,7 @@ def extract_folder_from_blobname(blobname: str) -> str:
   
 def extract_folder_from_result(selected_index: str, result) -> str:  
     try:  
-        container, blobname = resolve_container_blob_from_result(selected_index, result)  
+        container2, blobname = resolve_container_blob_from_result(selected_index, result)  
         if blobname:  
             return extract_folder_from_blobname(blobname)  
     except Exception:  
@@ -756,8 +758,13 @@ def load_chat_history():
             traceback.print_exc()  
         return sidebar_messages  
   
+# ★★★★★ ここから systemprompts_1 用のコード ★★★★★  
+  
 def save_system_prompt_item(title: str, content: str):  
-    if not container:  
+    """  
+    システムプロンプトの保存先を systemprompts_1 コンテナに変更  
+    """  
+    if not system_prompt_container:  
         return None  
     with lock:  
         try:  
@@ -772,7 +779,7 @@ def save_system_prompt_item(title: str, content: str):
                 'content': content,  
                 'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat()  
             }  
-            container.upsert_item(item)  
+            system_prompt_container.upsert_item(item)  
             return item['id']  
         except Exception as e:  
             print("システムプロンプト保存エラー:", e)  
@@ -780,7 +787,10 @@ def save_system_prompt_item(title: str, content: str):
             return None  
   
 def load_system_prompts():  
-    if not container:  
+    """  
+    systemprompts_1 コンテナからシステムプロンプトを読み込む  
+    """  
+    if not system_prompt_container:  
         return []  
     with lock:  
         get_authenticated_user()  
@@ -793,7 +803,11 @@ def load_system_prompts():
             ORDER BY c.timestamp DESC  
             """  
             parameters = [{"name": "@user_id", "value": session["user_id"]}]  
-            items = container.query_items(query=query, parameters=parameters, enable_cross_partition_query=True)  
+            items = system_prompt_container.query_items(  
+                query=query,  
+                parameters=parameters,  
+                enable_cross_partition_query=True  
+            )  
             for it in items:  
                 prompts.append({  
                     "id": it.get("id"),  
@@ -807,17 +821,22 @@ def load_system_prompts():
         return prompts  
   
 def delete_system_prompt(prompt_id: str):  
-    if not container:  
+    """  
+    systemprompts_1 コンテナからシステムプロンプトを削除  
+    """  
+    if not system_prompt_container:  
         return False  
     with lock:  
         try:  
             user_id = get_authenticated_user()  
-            container.delete_item(item=prompt_id, partition_key=user_id)  
+            system_prompt_container.delete_item(item=prompt_id, partition_key=user_id)  
             return True  
         except Exception as e:  
             print("システムプロンプト削除エラー:", e)  
             traceback.print_exc()  
             return False  
+  
+# ★★★★★ systemprompts_1 関連ここまで ★★★★★  
   
 def start_new_chat():  
     image_filenames = session.get("image_filenames", [])  
@@ -1539,16 +1558,16 @@ def send_message():
             for r in results_list:  
                 title = r.get('title', '不明')  
                 content = r.get('content', '')  
-                container_name, blobname = resolve_container_blob_from_result(selected_index, r)  
+                container_name2, blobname = resolve_container_blob_from_result(selected_index, r)  
                 url = ''  
-                if container_name and blobname:  
+                if container_name2 and blobname:  
                     try:  
                         is_text = blobname.lower().endswith('.txt')  
-                        url = build_download_url(container_name, blobname, is_text)  # 常に中継  
+                        url = build_download_url(container_name2, blobname, is_text)  # 常に中継  
                     except Exception as e:  
                         print("ダウンロードURL生成エラー:", e)  
-                        url = url_for('download_blob', container=container_name, blobname=quote(blobname))  
-                path_display = r.get('filepath') or (f"{container_name}/{blobname}" if (container_name and blobname) else (r.get('url') or r.get('metadata_storage_path') or ''))  
+                        url = url_for('download_blob', container=container_name2, blobname=quote(blobname))  
+                path_display = r.get('filepath') or (f"{container_name2}/{blobname}" if (container_name2 and blobname) else (r.get('url') or r.get('metadata_storage_path') or ''))  
                 folder = extract_folder_from_result(selected_index, r)  
                 search_files.append({'title': title, 'content': content, 'url': url, 'filepath': path_display, 'folder': folder})  
         else:  
@@ -1777,16 +1796,16 @@ def stream_message():
                 for r in results_list:  
                     title = r.get('title', '不明')  
                     content = r.get('content', '')  
-                    container_name, blobname = resolve_container_blob_from_result(selected_index, r)  
+                    container_name2, blobname = resolve_container_blob_from_result(selected_index, r)  
                     url = ''  
-                    if container_name and blobname:  
+                    if container_name2 and blobname:  
                         try:  
                             is_text = blobname.lower().endswith('.txt')  
-                            url = build_download_url(container_name, blobname, is_text)  # 常に中継  
+                            url = build_download_url(container_name2, blobname, is_text)  # 常に中継  
                         except Exception as e:  
                             print("ダウンロードURL生成エラー:", e)  
-                            url = url_for('download_blob', container=container_name, blobname=quote(blobname))  
-                    path_display = r.get('filepath') or (f"{container_name}/{blobname}" if (container_name and blobname) else (r.get('url') or r.get('metadata_storage_path') or ''))  
+                            url = url_for('download_blob', container=container_name2, blobname=quote(blobname))  
+                    path_display = r.get('filepath') or (f"{container_name2}/{blobname}" if (container_name2 and blobname) else (r.get('url') or r.get('metadata_storage_path') or ''))  
                     folder = extract_folder_from_result(selected_index, r)  
                     search_files.append({'title': title, 'content': content, 'url': url, 'filepath': path_display, 'folder': folder})  
                 result_holder["search_files"] = search_files  
