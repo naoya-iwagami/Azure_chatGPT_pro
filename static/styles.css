@@ -1,3 +1,4 @@
+/* static/styles.css */  
 html, body {  
         width: 100%;  
         height: 100%;  
@@ -179,4 +180,23 @@ html, body {
 }  
 .rq-list li {  
         margin-bottom: 2px;  
+}  
+  
+/* デバッグ情報表示用 */  
+.debug-block {  
+        margin-top: 6px;  
+        font-size: 0.8em;  
+        background: #fff3f3;  
+        border-left: 3px solid #d9534f;  
+        padding: 4px 8px;  
+        max-height: 220px;  
+        overflow: auto;  
+}  
+.debug-block > summary {  
+        cursor: pointer;  
+        font-weight: 600;  
+}  
+.debug-block pre {  
+        white-space: pre-wrap;  
+        margin: 4px 0 0 0;  
 }  

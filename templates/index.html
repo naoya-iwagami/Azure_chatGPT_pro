@@ -1,3 +1,4 @@
+<!-- templates/index.html -->  
 <!DOCTYPE html>  
 <html lang="ja">  
 <head>  
@@ -337,6 +338,29 @@ document.addEventListener('DOMContentLoaded', function() {
     return bubble;  
   }  
   
+  // デバッグ情報をアシスタントメッセージの下に表示する  
+  function appendDebugBlock(bubbleEl, title, debugObj) {  
+    if (!bubbleEl || !debugObj) return;  
+    try {  
+      const details = document.createElement('details');  
+      details.className = 'debug-block';  
+      details.open = false;  // 初期状態は閉じる  
+  
+      const summary = document.createElement('summary');  
+      summary.textContent = title || '送信内容デバッグ';  
+  
+      const pre = document.createElement('pre');  
+      pre.textContent = JSON.stringify(debugObj, null, 2);  
+  
+      details.appendChild(summary);  
+      details.appendChild(pre);  
+      bubbleEl.appendChild(details);  
+      scrollChatToBottom();  
+    } catch (e) {  
+      console.error('appendDebugBlock error:', e);  
+    }  
+  }  
+  
   function renderRewrittenQueriesUnder(targetBubbleEl, payload) {  
     try {  
       if (!targetBubbleEl) return;  
@@ -379,6 +403,8 @@ document.addEventListener('DOMContentLoaded', function() {
     } catch (_) {}  
   }  
   
+  // アシスタント用メッセージコンテナを作成し、  
+  // 本文要素とバブル要素の両方を返す  
   function appendAssistantStreamContainer() {  
     const c = document.createElement('div');  
     c.className = 'message-container assistant';  
@@ -388,7 +414,9 @@ document.addEventListener('DOMContentLoaded', function() {
       </div>`;  
     chatBox.appendChild(c);  
     scrollChatToBottom();  
-    return c.querySelector('.assistant-message');  
+    const msgEl = c.querySelector('.assistant-message');  
+    const bubbleEl = c.querySelector('.message-bubble');  
+    return { msgEl, bubbleEl };  
   }  
   
   function replaceAssistantContainerHtml(targetEl, html) {  
@@ -487,7 +515,7 @@ document.addEventListener('DOMContentLoaded', function() {
   }  
   
   function startSSE(prompt) {  
-    const streamEl = appendAssistantStreamContainer();  
+    const { msgEl: streamEl, bubbleEl: assistantBubble } = appendAssistantStreamContainer();  
     let accText = '';  
     let finished = false;  // 終了判定フラグ  
   
@@ -547,6 +575,18 @@ document.addEventListener('DOMContentLoaded', function() {
           }  
         } catch (_) {}  
       });  
+  
+      // ★ debug イベント  
+      es.addEventListener('debug', ev => {  
+        try {  
+          const data = JSON.parse(ev.data);  
+          console.log('DEBUG from server:', data);  
+          appendDebugBlock(assistantBubble, '送信内容デバッグ', data);  
+        } catch (e) {  
+          console.error('SSE debug event error:', e);  
+        }  
+      });  
+  
       es.addEventListener('error', ev => {  
         try { console.error('SSE error event:', JSON.parse(ev.data)); } catch (_) {}  
       });  
@@ -616,6 +656,12 @@ document.addEventListener('DOMContentLoaded', function() {
         renderSearchFiles(data.search_files);  
       } else {  
         clearSearchFilesDisplay();  
+      }  
+  
+      // ★ 非ストリーミング時のデバッグ表示  
+      if (data.debug && bubbleEl) {  
+        console.log('DEBUG from /send_message:', data.debug);  
+        appendDebugBlock(bubbleEl, '送信内容デバッグ', data.debug);  
       }  
     })  
     .catch(e => {  

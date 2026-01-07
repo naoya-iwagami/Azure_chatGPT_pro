@@ -42,8 +42,8 @@ from azure.cosmos import CosmosClient
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions  
 from openai import AzureOpenAI  
 import markdown2  
-from azure.identity import AzureCliCredential, ManagedIdentityCredential    
-  
+from azure.identity import AzureCliCredential, ManagedIdentityCredential  
+
 # ------------------------------- アプリ環境/Flask -------------------------------  
 APP_ENV = os.getenv("APP_ENV", "prod").lower()  
 IS_LOCAL = APP_ENV == "local"  
@@ -120,7 +120,7 @@ RECALL_PARENT_THRESHOLD_FRACTION = float(os.getenv("RECALL_PARENT_THRESHOLD_FRAC
 MIN_UNIQUE_PARENTS_ABS = int(os.getenv("MIN_UNIQUE_PARENTS_ABS", "3"))  
   
 # 添付の最大バイト（超過時は添付スキップ）  
-MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(5 * 1024 * 1024)))  # 5MB  
+MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(30 * 1024 * 1024)))  # 30MB  
   
 # ------------------------------- Azure サービスクライアント（AAD） -------------------------------  
 search_service_endpoint = os.getenv("AZURE_SEARCH_ENDPOINT")  
@@ -1483,7 +1483,8 @@ def send_message():
                 'search_files': [],  
                 'reasoning_summary': '',  
                 'rewritten_queries': [],  
-                'session_id': session.get("current_session_id", "")  
+                'session_id': session.get("current_session_id", ""),  
+                'debug': None,  
             }),  
             400,  
             {'Content-Type': 'application/json'}  
@@ -1506,6 +1507,7 @@ def send_message():
         session["main_chat_messages"] = messages  
         session.modified = True  
   
+    # ユーザメッセージを追加  
     messages.append({"role": "user", "content": prompt, "type": "text"})  
     session["main_chat_messages"] = messages  
     session.modified = True  
@@ -1516,6 +1518,7 @@ def send_message():
         doc_count = max(1, min(300, int(session.get("doc_count", DEFAULT_DOC_COUNT))))  
         rag_enabled = bool(session.get("rag_enabled", True))  
   
+        # system_message の決定  
         system_message = session.get("default_system_message", "")  
         sb_for_sys = session.get("sidebar_messages", [])  
         if active_sid:  
@@ -1531,6 +1534,7 @@ def send_message():
         search_files = []  
         context = ""  
   
+        # ------------ RAG 部分 ------------  
         if rag_enabled:  
             queries = rewrite_queries_for_search_responses(messages, prompt, system_message)  
   
@@ -1563,17 +1567,27 @@ def send_message():
                 if container_name2 and blobname:  
                     try:  
                         is_text = blobname.lower().endswith('.txt')  
-                        url = build_download_url(container_name2, blobname, is_text)  # 常に中継  
+                        url = build_download_url(container_name2, blobname, is_text)  
                     except Exception as e:  
                         print("ダウンロードURL生成エラー:", e)  
                         url = url_for('download_blob', container=container_name2, blobname=quote(blobname))  
-                path_display = r.get('filepath') or (f"{container_name2}/{blobname}" if (container_name2 and blobname) else (r.get('url') or r.get('metadata_storage_path') or ''))  
+                path_display = r.get('filepath') or (  
+                    f"{container_name2}/{blobname}" if (container_name2 and blobname)  
+                    else (r.get('url') or r.get('metadata_storage_path') or '')  
+                )  
                 folder = extract_folder_from_result(selected_index, r)  
-                search_files.append({'title': title, 'content': content, 'url': url, 'filepath': path_display, 'folder': folder})  
+                search_files.append({  
+                    'title': title,  
+                    'content': content,  
+                    'url': url,  
+                    'filepath': path_display,  
+                    'folder': folder  
+                })  
         else:  
             queries = []  
             search_files = []  
             context = ""  
+        # ------------ RAG 部分ここまで ------------  
   
         history_to_send = session.get("history_to_send", MAX_HISTORY_TO_SEND)  
         input_items, target_user_index = build_responses_input_with_history(  
@@ -1590,9 +1604,13 @@ def send_message():
                     target_user_index = i  
                     break  
   
-        # 画像は data: スキームで添付（SASは使用しない）  
+        # 添付ファイル一覧（デバッグ用にも使う）  
+        image_filenames = session.get("image_filenames", [])  
+        file_filenames = session.get("file_filenames", [])  
+  
+        # 画像 / PDF 添付  
         if target_user_index is not None:  
-            image_filenames = session.get("image_filenames", [])  
+            # 画像  
             for img_blob in image_filenames:  
                 if not image_container_client:  
                     continue  
@@ -1614,7 +1632,7 @@ def send_message():
                     print("画像添付Base64生成エラー:", e)  
                     traceback.print_exc()  
   
-            file_filenames = session.get("file_filenames", [])  
+            # PDF  
             for pdf_blob in file_filenames:  
                 if not pdf_blob.lower().endswith('.pdf') or not file_container_client:  
                     continue  
@@ -1636,12 +1654,59 @@ def send_message():
                     print("PDF添付Base64生成エラー:", e)  
                     traceback.print_exc()  
   
+        # モデル / reasoning 設定  
         model_to_use = session.get("selected_model", RESPONSES_MODEL)  
+        effort = session.get("reasoning_effort", REASONING_EFFORT)  
+        if effort not in {"low", "medium", "high"}:  
+            effort = REASONING_EFFORT  
+        enable_reasoning = model_to_use in REASONING_ENABLED_MODELS  
+  
+        # ------------ デバッグ情報作成 ------------  
+        input_summary = []  
+        try:  
+            for item in input_items:  
+                role = item.get("role")  
+                contents = item.get("content") or []  
+                texts = []  
+                for c in contents:  
+                    ctype = c.get("type")  
+                    if ctype in ("input_text", "output_text", "text"):  
+                        t = (c.get("text") or "")  
+                        if len(t) > 120:  
+                            t = t[:120] + "…"  
+                        texts.append(t)  
+                    elif ctype == "input_image":  
+                        texts.append("[画像添付]")  
+                    elif ctype == "input_file":  
+                        filename = c.get("filename") or "（ファイル名不明）"  
+                        texts.append(f"[ファイル添付: {filename}]")  
+                input_summary.append({"role": role, "contents": texts})  
+        except Exception as e:  
+            print("debug input_summary 生成エラー(send_message):", e)  
+            traceback.print_exc()  
+  
+        debug_info = {  
+            "session_id": active_sid,  
+            "selected_model": model_to_use,  
+            "reasoning_effort": effort if enable_reasoning else None,  
+            "rag_enabled": rag_enabled,  
+            "selected_index": selected_index,  
+            "doc_count": doc_count,  
+            "history_to_send": history_to_send,  
+            "system_message": (system_message or "")[:500],  
+            "queries": queries,  
+            "context_length": len(context or ""),  
+            "context_preview": (context or "")[:400],  
+            "message_count_before": len(messages),  
+            "attachment_images": image_filenames,  
+            "attachment_files": file_filenames,  
+            "input_summary": input_summary,  
+        }  
+        # ------------ デバッグ情報ここまで ------------  
+  
+        # OpenAI 呼び出し  
         request_kwargs = dict(model=model_to_use, input=input_items, store=False)  
-        if model_to_use in REASONING_ENABLED_MODELS:  
-            effort = session.get("reasoning_effort", REASONING_EFFORT)  
-            if effort not in {"low", "medium", "high"}:  
-                effort = REASONING_EFFORT  
+        if enable_reasoning:  
             request_kwargs["reasoning"] = {"effort": effort}  
   
         response = client.responses.create(**request_kwargs)  
@@ -1665,7 +1730,8 @@ def send_message():
                 'search_files': search_files,  
                 'reasoning_summary': reasoning_summary,  
                 'rewritten_queries': queries,  
-                'session_id': active_sid  
+                'session_id': active_sid,  
+                'debug': debug_info,  
             }),  
             200,  
             {'Content-Type': 'application/json'}  
@@ -1680,7 +1746,8 @@ def send_message():
                 'search_files': [],  
                 'reasoning_summary': '',  
                 'rewritten_queries': [],  
-                'session_id': active_sid  
+                'session_id': active_sid,  
+                'debug': None,  
             }),  
             500,  
             {'Content-Type': 'application/json'}  
@@ -1720,6 +1787,7 @@ def stream_message():
         session["main_chat_messages"] = messages  
         session.modified = True  
   
+    # ユーザメッセージ追加  
     messages.append({"role": "user", "content": prompt, "type": "text"})  
     session["main_chat_messages"] = messages  
     session.modified = True  
@@ -1767,6 +1835,7 @@ def stream_message():
             context = ""  
             queries = []  
   
+            # ------------ RAG 部分 ------------  
             if rag_enabled:  
                 queries = rewrite_queries_for_search_responses(messages, prompt, system_message)  
                 q.put(_sse_event("rewritten_queries", {"queries": queries}))  
@@ -1801,19 +1870,29 @@ def stream_message():
                     if container_name2 and blobname:  
                         try:  
                             is_text = blobname.lower().endswith('.txt')  
-                            url = build_download_url(container_name2, blobname, is_text)  # 常に中継  
+                            url = build_download_url(container_name2, blobname, is_text)  
                         except Exception as e:  
                             print("ダウンロードURL生成エラー:", e)  
                             url = url_for('download_blob', container=container_name2, blobname=quote(blobname))  
-                    path_display = r.get('filepath') or (f"{container_name2}/{blobname}" if (container_name2 and blobname) else (r.get('url') or r.get('metadata_storage_path') or ''))  
+                    path_display = r.get('filepath') or (  
+                        f"{container_name2}/{blobname}" if (container_name2 and blobname)  
+                        else (r.get('url') or r.get('metadata_storage_path') or '')  
+                    )  
                     folder = extract_folder_from_result(selected_index, r)  
-                    search_files.append({'title': title, 'content': content, 'url': url, 'filepath': path_display, 'folder': folder})  
+                    search_files.append({  
+                        'title': title,  
+                        'content': content,  
+                        'url': url,  
+                        'filepath': path_display,  
+                        'folder': folder  
+                    })  
                 result_holder["search_files"] = search_files  
                 q.put(_sse_event("search_files", search_files))  
             else:  
                 queries = []  
                 search_files = []  
                 context = ""  
+            # ------------ RAG 部分ここまで ------------  
   
             input_items, target_user_index = build_responses_input_with_history(  
                 all_messages=messages,  
@@ -1828,8 +1907,10 @@ def stream_message():
                     if input_items[i].get("role") == "user":  
                         target_user_index = i  
                         break  
-            # 画像は data: スキームで添付（SASは使用しない）  
+  
+            # 添付ファイル（デバッグ情報にも使うため変数は外側のを参照）  
             if target_user_index is not None:  
+                # 画像  
                 for img_blob in image_filenames:  
                     if not image_container_client:  
                         continue  
@@ -1851,6 +1932,7 @@ def stream_message():
                         print("画像添付Base64生成エラー:", e)  
                         traceback.print_exc()  
   
+                # PDF  
                 for pdf_blob in file_filenames:  
                     if not pdf_blob.lower().endswith('.pdf') or not file_container_client:  
                         continue  
@@ -1872,6 +1954,51 @@ def stream_message():
                         print("PDF添付Base64生成エラー:", e)  
                         traceback.print_exc()  
   
+            # ------------ デバッグ情報: モデルに渡す内容のサマリを送信 ------------  
+            input_summary = []  
+            try:  
+                for item in input_items:  
+                    role = item.get("role")  
+                    contents = item.get("content") or []  
+                    texts = []  
+                    for c in contents:  
+                        ctype = c.get("type")  
+                        if ctype in ("input_text", "output_text", "text"):  
+                            t = (c.get("text") or "")  
+                            if len(t) > 120:  
+                                t = t[:120] + "…"  
+                            texts.append(t)  
+                        elif ctype == "input_image":  
+                            texts.append("[画像添付]")  
+                        elif ctype == "input_file":  
+                            filename = c.get("filename") or "（ファイル名不明）"  
+                            texts.append(f"[ファイル添付: {filename}]")  
+                    input_summary.append({"role": role, "contents": texts})  
+            except Exception as e:  
+                print("debug input_summary 生成エラー(stream_message):", e)  
+                traceback.print_exc()  
+  
+            debug_info = {  
+                "session_id": active_sid,  
+                "selected_model": model_to_use,  
+                "reasoning_effort": effort if enable_reasoning else None,  
+                "rag_enabled": rag_enabled,  
+                "selected_index": selected_index,  
+                "doc_count": doc_count,  
+                "history_to_send": history_to_send,  
+                "system_message": (system_message or "")[:500],  
+                "queries": queries,  
+                "context_length": len(context or ""),  
+                "context_preview": (context or "")[:400],  
+                "message_count_before": len(messages),  
+                "attachment_images": image_filenames,  
+                "attachment_files": file_filenames,  
+                "input_summary": input_summary,  
+            }  
+            q.put(_sse_event("debug", debug_info))  
+            # ------------ デバッグ情報ここまで ------------  
+  
+            # OpenAI Responses Streaming  
             request_kwargs = dict(model=model_to_use, input=input_items, store=False)  
             if enable_reasoning:  
                 request_kwargs["reasoning"] = {"effort": effort}  
@@ -1885,7 +2012,7 @@ def stream_message():
                             result_holder["full_text"] += delta  
                             q.put(_sse_event("delta", {"text": delta}))  
                     elif etype.endswith(".delta"):  
-                        delta = getattr(event, "delta", "")  
+                        delta = getattr(event, "delta", "") or ""  
                         if isinstance(delta, str) and delta:  
                             result_holder["full_text"] += delta  
                             q.put(_sse_event("delta", {"text": delta}))  
