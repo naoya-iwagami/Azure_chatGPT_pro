@@ -42,8 +42,8 @@ from azure.cosmos import CosmosClient
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions  
 from openai import AzureOpenAI  
 import markdown2  
-from azure.identity import AzureCliCredential, ManagedIdentityCredential  
-
+from azure.identity import AzureCliCredential, ManagedIdentityCredential   
+  
 # ------------------------------- アプリ環境/Flask -------------------------------  
 APP_ENV = os.getenv("APP_ENV", "prod").lower()  
 IS_LOCAL = APP_ENV == "local"  
@@ -2039,6 +2039,19 @@ def stream_message():
             ) or "<p>（応答テキストが空でした。もう一度お試しください）</p>"  
             result_holder["assistant_html"] = assistant_html  
   
+            # ★ 修正案A: ここで履歴保存する  
+            try:  
+                if full_text or assistant_html:  
+                    persist_assistant_message(  
+                        active_sid=active_sid,  
+                        assistant_html=assistant_html,  
+                        full_text=full_text,  
+                        system_message=system_message  
+                    )  
+            except Exception as e:  
+                print("SSE producer 履歴保存エラー:", e)  
+                traceback.print_exc()  
+  
             if result_holder["reasoning_summary"]:  
                 q.put(_sse_event("reasoning_summary", {"summary": result_holder["reasoning_summary"]}))  
   
@@ -2071,17 +2084,6 @@ def stream_message():
             if chunk is None:  
                 break  
             yield chunk  
-        try:  
-            if result_holder["assistant_html"] or result_holder["full_text"]:  
-                persist_assistant_message(  
-                    active_sid=active_sid,  
-                    assistant_html=result_holder["assistant_html"],  
-                    full_text=result_holder["full_text"],  
-                    system_message=system_message  
-                )  
-        except Exception as e:  
-            print("SSE後処理の履歴保存エラー:", e)  
-            traceback.print_exc()  
   
     headers = {  
         "Content-Type": "text/event-stream; charset=utf-8",  

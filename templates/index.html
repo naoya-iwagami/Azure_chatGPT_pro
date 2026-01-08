@@ -1,4 +1,3 @@
-<!-- templates/index.html -->  
 <!DOCTYPE html>  
 <html lang="ja">  
 <head>  
@@ -311,6 +310,8 @@ document.addEventListener('DOMContentLoaded', function() {
   let currentSearchFiles = [];  
   
   let lastUserBubbleEl = null;  
+  // ★ 修正案B: 送信中フラグ  
+  let isSending = false;  
   
   function scrollChatToBottom() { chatBox.scrollTop = chatBox.scrollHeight; }  
   
@@ -595,6 +596,7 @@ document.addEventListener('DOMContentLoaded', function() {
         es.close();  
         sendButton.disabled = false;  
         hideLoading();  
+        isSending = false;  // ★ 送信終了  
         scrollChatToBottom();  
       });  
       es.onerror = function(err) {  
@@ -605,6 +607,7 @@ document.addEventListener('DOMContentLoaded', function() {
         es.close();  
         sendButton.disabled = false;  
         hideLoading();  
+        // isSending は fallbackJsonSubmit が finally で false に戻す  
         fallbackJsonSubmit(prompt);  
       };  
     })  
@@ -612,6 +615,7 @@ document.addEventListener('DOMContentLoaded', function() {
       console.error(err);  
       sendButton.disabled = false;  
       hideLoading();  
+      isSending = false;  // ★ エラー時も解除  
       alert('送信に失敗しました');  
     });  
   }  
@@ -665,21 +669,26 @@ document.addEventListener('DOMContentLoaded', function() {
       }  
     })  
     .catch(e => {  
-      sendButton.disabled = false;  
-      hideLoading();  
+      console.error(e);  
       alert('エラーが発生しました');  
     })  
     .finally(() => {  
       sendButton.disabled = false;  
       hideLoading();  
+      isSending = false;  // ★ JSON完了時に解除  
       scrollChatToBottom();  
     });  
   }  
   
   document.getElementById('chatForm').addEventListener('submit', e => {  
     e.preventDefault();  
+    if (isSending) {  
+      // ★ 連打やストリーミング中の送信を防止  
+      return;  
+    }  
     const prompt = promptTextarea.value.trim();  
     if (!prompt) return;  
+    isSending = true;  // ★ 送信開始  
     const bubble = appendUserMessage(prompt);  
     lastUserBubbleEl = bubble;  
     promptTextarea.value = '';  
