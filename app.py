@@ -43,6 +43,9 @@ from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPerm
 from openai import AzureOpenAI  
 import markdown2  
 from azure.identity import AzureCliCredential, ManagedIdentityCredential   
+
+os.environ['HTTP_PROXY'] = 'http://g3.konicaminolta.jp:8080'
+os.environ['HTTPS_PROXY'] = 'http://g3.konicaminolta.jp:8080'
   
 # ------------------------------- アプリ環境/Flask -------------------------------  
 APP_ENV = os.getenv("APP_ENV", "prod").lower()  
@@ -111,7 +114,7 @@ RRF_FETCH_MULTIPLIER = float(os.getenv("RRF_FETCH_MULTIPLIER", "3.0"))
 RRF_FETCH_MAX_TOP = int(os.getenv("RRF_FETCH_MAX_TOP", "300"))  
   
 MAX_CHUNKS_PER_PARENT = int(os.getenv("MAX_CHUNKS_PER_PARENT", "0"))  
-REWRITE_MODEL = "gpt-4o"  
+REWRITE_MODEL = "gpt-4.1"  
 MAX_REWRITE_TURNS = max(1, min(8, int(os.getenv("MAX_REWRITE_TURNS", "4"))))  
   
 ENABLE_HYDE = os.getenv("ENABLE_HYDE", "1") not in ("0", "false", "False")  
@@ -472,17 +475,21 @@ def rewrite_queries_for_search_responses(messages: list, current_prompt: str, sy
     context = "\n".join(history_lines)  
   
     system_prompt = (  
-        "あなたは社内文書検索クエリ生成AIです。\n"  
-        "出力仕様: {\"queries\":[\"...\", \"...\"]} の JSON を 1 行だけ返す。\n"  
-        "・各クエリは30文字以内、日本語主体、必要なら英語同義語併記。\n"  
-        "・最大4件生成。\n"  
-        "・説明・前後の余分な文字・改行は禁止。"  
-    )  
+    "あなたは社内文書検索クエリ生成AIです。\n"  
+    "出力仕様: {\"queries\":[\"...\", \"...\"]} の JSON を 1 行だけ返す。\n"  
+    "・各クエリは30文字以内、日本語主体、必要なら英語同義語併記。\n"  
+    "・最大4件生成。\n"  
+    "・複数クエリを出すときは、互いにできるだけ異なる観点やキーワード構成にしてください。\n"  
+    "・同じ単語を並べ替えただけ、助詞だけを変えただけなど、意味がほぼ同じクエリは生成しないでください。\n"  
+    "・意味が大きく変わる候補が2〜3件しか思いつかない場合は、その件数だけで構いません。\n"  
+    "・説明・前後の余分な文字・改行は禁止。"  
+)  
     user_prompt = (  
-        f"history{{{context}}}\n"  
-        f"endtask ユーザの意図を最もよく表す検索クエリを最大4件生成してください。\n"  
-        f"最新ユーザ質問: {current_prompt}"  
-    )  
+    f"history{{{context}}}\n"  
+    "endtask ユーザの意図をよく表す文書検索用クエリを最大4件生成してください。\n"  
+    "可能であれば、表現や観点が少しずつ異なるクエリを含めてください。\n"  
+    f"最新ユーザ質問: {current_prompt}"  
+)   
   
     input_items = [  
         {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},  
@@ -491,7 +498,7 @@ def rewrite_queries_for_search_responses(messages: list, current_prompt: str, sy
     resp = client.responses.create(  
         model=REWRITE_MODEL,  
         input=input_items,  
-        temperature=0.05,  
+        temperature=0.8,  
         max_output_tokens=256,  
         store=False  
     )  
