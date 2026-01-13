@@ -42,8 +42,8 @@ from azure.cosmos import CosmosClient
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions  
 from openai import AzureOpenAI  
 import markdown2  
-from azure.identity import AzureCliCredential, ManagedIdentityCredential   
-
+from azure.identity import AzureCliCredential, ManagedIdentityCredential  
+  
 # ------------------------------- アプリ環境/Flask -------------------------------  
 APP_ENV = os.getenv("APP_ENV", "prod").lower()  
 IS_LOCAL = APP_ENV == "local"  
@@ -486,7 +486,7 @@ def rewrite_queries_for_search_responses(messages: list, current_prompt: str, sy
     "endtask ユーザの意図をよく表す文書検索用クエリを最大4件生成してください。\n"  
     "可能であれば、表現や観点が少しずつ異なるクエリを含めてください。\n"  
     f"最新ユーザ質問: {current_prompt}"  
-)   
+)  
   
     input_items = [  
         {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},  
@@ -632,6 +632,7 @@ def persist_assistant_message(active_sid: str, assistant_html: str, full_text: s
             if container:  
                 container.upsert_item(item)  
   
+            # セッションは表示用キャッシュとして更新（SSEの場合は保存されないが問題ない）  
             session["main_chat_messages"] = merged_msgs  
             sb = session.get("sidebar_messages", [])  
             updated = False  
@@ -658,71 +659,14 @@ def persist_assistant_message(active_sid: str, assistant_html: str, full_text: s
             traceback.print_exc()  
   
 def save_chat_history():  
+    """  
+    互換性維持のために残していますが、  
+    現在は send_message / stream_message からは呼ばないようにしています。  
+    Cosmos 側が正本となる設計にしたため、ここから Cosmos を上書きしない方が安全です。  
+    """  
     if not container:  
         return  
-    with lock:  
-        try:  
-            active_sid = session.get("current_session_id")  
-            msgs = session.get("main_chat_messages", []) or []  
-            if not active_sid or not msgs:  
-                return  
-  
-            user_id = get_authenticated_user()  
-            existing = []  
-            try:  
-                existing_item = container.read_item(item=active_sid, partition_key=user_id)  
-                existing = existing_item.get("messages", []) or []  
-            except Exception:  
-                pass  
-            msgs = merge_messages(existing, msgs)  
-  
-            if not compute_has_assistant(msgs):  
-                return  
-  
-            system_message = session.get("default_system_message", "あなたは親切なAIアシスタントです…")  
-            sb = session.get("sidebar_messages", [])  
-            if active_sid and sb:  
-                match = next((c for c in sb if c.get("session_id") == active_sid), None)  
-                if match and match.get("system_message"):  
-                    system_message = match.get("system_message")  
-  
-            fam = compute_first_assistant_title(msgs) or ""  
-            user_name = session.get("user_name", "anonymous")  
-            item = {  
-                'id': active_sid,  
-                'user_id': user_id,  
-                'user_name': user_name,  
-                'session_id': active_sid,  
-                'messages': msgs,  
-                'system_message': system_message,  
-                'first_assistant_message': fam,  
-                'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat()  
-            }  
-            container.upsert_item(item)  
-  
-            session["main_chat_messages"] = msgs  
-            sb = session.get("sidebar_messages", [])  
-            updated = False  
-            for i, chat in enumerate(sb):  
-                if chat.get("session_id") == active_sid:  
-                    sb[i]["messages"] = msgs  
-                    sb[i]["first_assistant_message"] = fam  
-                    sb[i]["system_message"] = system_message  
-                    session["sidebar_messages"] = sb  
-                    updated = True  
-                    break  
-            if not updated:  
-                sb.insert(0, {  
-                    "session_id": active_sid,  
-                    "messages": msgs,  
-                    "first_assistant_message": fam,  
-                    "system_message": system_message  
-                })  
-                session["sidebar_messages"] = sb  
-            session.modified = True  
-        except Exception as e:  
-            print("チャット履歴保存エラー:", e)  
-            traceback.print_exc()  
+    # 何もしないか、必要であれば将来用に実装を追加  
   
 def load_chat_history():  
     if not container:  
@@ -1267,6 +1211,7 @@ def index():
                 if chat.get("session_id") == sid:  
                     session["current_chat_index"] = i  
                     session["current_session_id"] = sid  
+                    # 常に Cosmos を優先  
                     msgs = ensure_messages_from_cosmos(sid) or chat.get("messages", [])  
                     session["main_chat_messages"] = msgs  
                     session.modified = True  
@@ -1505,17 +1450,21 @@ def send_message():
             start_new_chat()  
             active_sid = session.get("current_session_id")  
   
-    messages = session.get("main_chat_messages", [])  
-    if not messages and container and active_sid:  
-        messages = ensure_messages_from_cosmos(active_sid)  
-        session["main_chat_messages"] = messages  
-        session.modified = True  
+    # ★ ここで毎回 Cosmos から最新履歴を読み込む（なければ空リスト）  
+    if container and active_sid:  
+        messages = ensure_messages_from_cosmos(active_sid) or []  
+    else:  
+        messages = session.get("main_chat_messages", []) or []  
+  
+    # 表示用キャッシュとして session にコピー  
+    session["main_chat_messages"] = messages  
+    session.modified = True  
   
     # ユーザメッセージを追加  
     messages.append({"role": "user", "content": prompt, "type": "text"})  
     session["main_chat_messages"] = messages  
     session.modified = True  
-    save_chat_history()  
+    # ※ save_chat_history() は呼ばない（Cosmos は assistant 保存時に更新）  
   
     try:  
         selected_index = session.get("selected_search_index", DEFAULT_SEARCH_INDEX)  
@@ -1721,6 +1670,7 @@ def send_message():
         ) or "<p>（応答テキストが空でした。もう一度お試しください）</p>"  
         reasoning_summary = extract_reasoning_summary(response)  
   
+        # ★ assistant を Cosmos に保存（ここで session と Cosmos の整合を取る）  
         persist_assistant_message(  
             active_sid=active_sid,  
             assistant_html=assistant_html,  
@@ -1785,17 +1735,21 @@ def stream_message():
             start_new_chat()  
             active_sid = session.get("current_session_id")  
   
-    messages = session.get("main_chat_messages", [])  
-    if not messages and container and active_sid:  
-        messages = ensure_messages_from_cosmos(active_sid)  
-        session["main_chat_messages"] = messages  
-        session.modified = True  
+    # ★ ここでも毎回 Cosmos 側から最新履歴を取得する  
+    if container and active_sid:  
+        messages = ensure_messages_from_cosmos(active_sid) or []  
+    else:  
+        messages = session.get("main_chat_messages", []) or []  
+  
+    # セッションの表示用キャッシュを更新  
+    session["main_chat_messages"] = messages  
+    session.modified = True  
   
     # ユーザメッセージ追加  
     messages.append({"role": "user", "content": prompt, "type": "text"})  
     session["main_chat_messages"] = messages  
     session.modified = True  
-    save_chat_history()  
+    # ※ save_chat_history() は呼ばない（Cosmos は assistant 保存時に更新）  
   
     selected_index = session.get("selected_search_index", DEFAULT_SEARCH_INDEX)  
     doc_count = max(1, min(300, int(session.get("doc_count", DEFAULT_DOC_COUNT))))  
@@ -2043,7 +1997,7 @@ def stream_message():
             ) or "<p>（応答テキストが空でした。もう一度お試しください）</p>"  
             result_holder["assistant_html"] = assistant_html  
   
-            # ★ 修正案A: ここで履歴保存する  
+            # assistant を Cosmos に保存  
             try:  
                 if full_text or assistant_html:  
                     persist_assistant_message(  
