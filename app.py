@@ -666,7 +666,7 @@ def save_chat_history():
     """  
     if not container:  
         return  
-    # 何もしないか、必要であれば将来用に実装を追加  
+    # 必要なら将来用に実装を追加  
   
 def load_chat_history():  
     if not container:  
@@ -1386,7 +1386,15 @@ def index():
             url = make_blob_url(file_container_name, blobname)  # /view_blob に統一  
             files.append({'name': display, 'blob': blobname, 'url': url})  
   
-    chat_history = session.get("main_chat_messages", [])  
+    # ★ ここを追加：アクティブなチャットIDの履歴を必ず Cosmos から読み直す  
+    active_sid = session.get("current_session_id")  
+    if container and active_sid:  
+        chat_history = ensure_messages_from_cosmos(active_sid) or []  
+        session["main_chat_messages"] = chat_history  
+        session.modified = True  
+    else:  
+        chat_history = session.get("main_chat_messages", []) or []  
+  
     sidebar_messages = session.get("sidebar_messages", [])  
     saved_prompts = session.get("saved_prompts", [])  
     max_displayed_history = 6  
