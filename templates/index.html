@@ -302,6 +302,17 @@ document.addEventListener('DOMContentLoaded', function() {
     sessionStorage.removeItem('chat_input');  
   });  
   
+  // ★ 会話IDの取得・更新ヘルパ  
+  const currentSessionEl = document.getElementById('currentSession');  
+  function getCurrentSessionId() {  
+    return currentSessionEl ? (currentSessionEl.dataset.sessionId || '') : '';  
+  }  
+  function setCurrentSessionId(sid) {  
+    if (currentSessionEl) {  
+      currentSessionEl.dataset.sessionId = sid || '';  
+    }  
+  }  
+  
   const chatForm = document.getElementById('chatForm');  
   const chatBox = document.getElementById('chatBox');  
   const sendButton = document.getElementById('sendButton');  
@@ -527,7 +538,10 @@ document.addEventListener('DOMContentLoaded', function() {
     fetch('/prepare_stream', {  
       method: 'POST',  
       headers: {'Content-Type': 'application/json'},  
-      body: JSON.stringify({ prompt })  
+      body: JSON.stringify({  
+        prompt: prompt,  
+        session_id: getCurrentSessionId()  
+      })  
     })  
     .then(r => {  
       if (!r.ok) throw new Error('prepare_stream failed');  
@@ -536,7 +550,10 @@ document.addEventListener('DOMContentLoaded', function() {
     .then(({ message_id }) => {  
       if (!message_id) throw new Error('no message_id');  
   
-      const es = new EventSource('/stream_message?mid=' + encodeURIComponent(message_id));  
+      const sid = getCurrentSessionId();  
+      const esUrl = '/stream_message?mid=' + encodeURIComponent(message_id)  
+                  + (sid ? '&sid=' + encodeURIComponent(sid) : '');  
+      const es = new EventSource(esUrl);  
   
       es.addEventListener('rewritten_queries', ev => {  
         try { renderRewrittenQueriesUnder(lastUserBubbleEl, JSON.parse(ev.data)); } catch (_) {}  
@@ -559,11 +576,10 @@ document.addEventListener('DOMContentLoaded', function() {
           if (data && typeof data.html === 'string') {  
             replaceAssistantContainerHtml(streamEl, data.html);  
             const title = extractTitleFromHtml(data.html, 10);  
-            const sid = data.session_id || (document.getElementById('currentSession')?.dataset.sessionId || '');  
+            const sid = data.session_id || getCurrentSessionId();  
             if (sid) {  
               upsertSidebarItemById(sid, title);  
-              const sidEl = document.getElementById('currentSession');  
-              if (sidEl) sidEl.dataset.sessionId = sid;  
+              setCurrentSessionId(sid);  
             }  
           }  
         } catch (_) {}  
@@ -628,7 +644,10 @@ document.addEventListener('DOMContentLoaded', function() {
     fetch('/send_message', {  
       method: 'POST',  
       headers: {'Content-Type': 'application/json'},  
-      body: JSON.stringify({prompt})  
+      body: JSON.stringify({  
+        prompt: prompt,  
+        session_id: getCurrentSessionId()  
+      })  
     })  
     .then(r => r.json())  
     .then(data => {  
@@ -649,11 +668,10 @@ document.addEventListener('DOMContentLoaded', function() {
         bubbleEl = c.querySelector('.message-bubble');  
   
         const t = extractTitleFromHtml(data.response, 10);  
-        const sid = data.session_id || (document.getElementById('currentSession')?.dataset.sessionId || '');  
+        const sid = data.session_id || getCurrentSessionId();  
         if (sid) {  
           upsertSidebarItemById(sid, t);  
-          const sidEl = document.getElementById('currentSession');  
-          if (sidEl) sidEl.dataset.sessionId = sid;  
+          setCurrentSessionId(sid);  
         }  
       }  
       if (Array.isArray(data.search_files) && data.search_files.length > 0) {  

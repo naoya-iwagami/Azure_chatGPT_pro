@@ -43,6 +43,7 @@ from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPerm
 from openai import AzureOpenAI  
 import markdown2  
 from azure.identity import AzureCliCredential, ManagedIdentityCredential  
+
   
 # ------------------------------- アプリ環境/Flask -------------------------------  
 APP_ENV = os.getenv("APP_ENV", "prod").lower()  
@@ -480,13 +481,13 @@ def rewrite_queries_for_search_responses(messages: list, current_prompt: str, sy
     "・同じ単語を並べ替えただけ、助詞だけを変えただけなど、意味がほぼ同じクエリは生成しないでください。\n"  
     "・意味が大きく変わる候補が2〜3件しか思いつかない場合は、その件数だけで構いません。\n"  
     "・説明・前後の余分な文字・改行は禁止。"  
-)  
+    )  
     user_prompt = (  
     f"history{{{context}}}\n"  
     "endtask ユーザの意図をよく表す文書検索用クエリを最大4件生成してください。\n"  
     "可能であれば、表現や観点が少しずつ異なるクエリを含めてください。\n"  
     f"最新ユーザ質問: {current_prompt}"  
-)  
+    )  
   
     input_items = [  
         {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},  
@@ -1422,6 +1423,12 @@ def prepare_stream():
     prompt = (data.get('prompt') or '').strip()  
     if not prompt:  
         return jsonify({"error": "missing prompt"}), 400  
+  
+    # ★ クライアントから渡された session_id があれば保持しておく  
+    client_sid = (data.get("session_id") or "").strip()  
+    if client_sid:  
+        session["current_session_id"] = client_sid  
+  
     prepared = session.get('prepared_prompts', {})  
     mid = str(uuid.uuid4())  
     prepared[mid] = prompt  
@@ -1431,7 +1438,7 @@ def prepare_stream():
   
 @app.route('/send_message', methods=['POST'])  
 def send_message():  
-    data = request.get_json()  
+    data = request.get_json() or {}  
     prompt = (data.get('prompt') or '').strip()  
     if not prompt:  
         return (  
@@ -1447,7 +1454,14 @@ def send_message():
             {'Content-Type': 'application/json'}  
         )  
   
-    active_sid = session.get("current_session_id")  
+    # ★ クライアントから渡された session_id を最優先  
+    client_sid = (data.get("session_id") or "").strip()  
+    if client_sid:  
+        active_sid = client_sid  
+        session["current_session_id"] = client_sid  
+    else:  
+        active_sid = session.get("current_session_id")  
+  
     if not active_sid:  
         sb = session.get("sidebar_messages", [])  
         if sb:  
@@ -1732,7 +1746,14 @@ def stream_message():
     if not prompt:  
         return ("missing prompt", 400, {"Content-Type": "text/plain; charset=utf-8"})  
   
-    active_sid = session.get("current_session_id")  
+    # ★ クライアントから渡された sid を最優先  
+    sid_param = (request.args.get("sid") or "").strip()  
+    if sid_param:  
+        active_sid = sid_param  
+        session["current_session_id"] = sid_param  
+    else:  
+        active_sid = session.get("current_session_id")  
+  
     if not active_sid:  
         sb = session.get("sidebar_messages", [])  
         if sb:  
