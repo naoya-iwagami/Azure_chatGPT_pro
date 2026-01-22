@@ -43,7 +43,12 @@ from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPerm
 from openai import AzureOpenAI  
 import markdown2  
 from azure.identity import AzureCliCredential, ManagedIdentityCredential  
-
+  
+# tiktoken（トークン数見積もり用）  
+try:  
+    import tiktoken  
+except ImportError:  
+    tiktoken = None  
   
 # ------------------------------- アプリ環境/Flask -------------------------------  
 APP_ENV = os.getenv("APP_ENV", "prod").lower()  
@@ -295,6 +300,96 @@ def strip_html_tags(html: str) -> str:
     text = re.sub(r'<[^>]+>', '', html)  
     return text  
   
+# ------------------------------- トークナイズ関連 -------------------------------  
+def _get_encoding_for_model(model_name: str):  
+    """  
+    モデル名から適切そうな tiktoken encoding を取得する。  
+    Azure のモデル名でも動くように、fallback を多めにしています。  
+    """  
+    if tiktoken is None:  
+        return None  
+    try:  
+        return tiktoken.encoding_for_model(model_name)  
+    except Exception:  
+        pass  
+    # o 系モデル用  
+    try:  
+        return tiktoken.get_encoding("o200k_base")  
+    except Exception:  
+        pass  
+    # それでもダメな場合の最後の手段  
+    try:  
+        return tiktoken.get_encoding("cl100k_base")  
+    except Exception:  
+        return None  
+  
+  
+def estimate_input_tokens(model_name: str, input_items: list):  
+    """  
+    Responses API に渡す input_items から「ざっくり」の入力トークン数を見積もる。  
+  
+    - text 系コンテンツ (input_text / output_text / text) だけを対象  
+    - 画像 (input_image) や PDF (input_file) はトークン数に含めない  
+      → その分、モデルの usage.input_tokens より少なめに出る  
+    """  
+    if not input_items:  
+        return 0  
+  
+    enc = _get_encoding_for_model(model_name)  
+    if enc is None:  
+        return None  
+  
+    parts = []  
+    try:  
+        for item in input_items:  
+            role = item.get("role", "user")  
+            contents = item.get("content") or []  
+            buf = [f"{role}: "]  
+            for c in contents:  
+                ctype = c.get("type")  
+                if ctype in ("input_text", "output_text", "text"):  
+                    t = c.get("text") or ""  
+                    buf.append(t)  
+            parts.append("\n".join(buf))  
+        full_text = "\n\n".join(parts)  
+        return len(enc.encode(full_text))  
+    except Exception as e:  
+        print("estimate_input_tokens エラー:", e)  
+        return None  
+  
+  
+def extract_usage_input_tokens(resp_obj, resp_payload):  
+    """  
+    Responses オブジェクトまたはその dict から usage.input_tokens を安全に取り出す。  
+    """  
+    # 1) オブジェクトから取る  
+    try:  
+        usage = getattr(resp_obj, "usage", None)  
+        if usage:  
+            val = getattr(usage, "input_tokens", None)  
+            if isinstance(val, int):  
+                return val  
+            # 念のため別名も試す  
+            val2 = getattr(usage, "input", None)  
+            if isinstance(val2, int):  
+                return val2  
+    except Exception:  
+        pass  
+  
+    # 2) dict から取る  
+    try:  
+        if isinstance(resp_payload, dict):  
+            usage2 = resp_payload.get("usage") or {}  
+            if isinstance(usage2, dict):  
+                val = usage2.get("input_tokens") or usage2.get("input")  
+                if isinstance(val, int):  
+                    return val  
+    except Exception:  
+        pass  
+  
+    return None  
+  
+# ------------------------------- その他ユーティリティ -------------------------------  
 def compute_first_assistant_title(messages, limit=30) -> str:  
     try:  
         for m in (messages or []):  
@@ -1376,16 +1471,16 @@ def index():
         for blobname in session.get("image_filenames", []):  
             base = blobname.split("/")[-1]  
             display = base.split("__", 1)[1] if "__" in base else base  
-            url = make_blob_url(image_container_name, blobname)  # /view_blob に統一  
-            images.append({'name': display, 'blob': blobname, 'url': url})  
+            url_img = make_blob_url(image_container_name, blobname)  # /view_blob に統一  
+            images.append({'name': display, 'blob': blobname, 'url': url_img})  
   
     files = []  
     if file_container_client:  
         for blobname in session.get("file_filenames", []):  
             base = blobname.split("/")[-1]  
             display = base.split("__", 1)[1] if "__" in base else base  
-            url = make_blob_url(file_container_name, blobname)  # /view_blob に統一  
-            files.append({'name': display, 'blob': blobname, 'url': url})  
+            url_file = make_blob_url(file_container_name, blobname)  # /view_blob に統一  
+            files.append({'name': display, 'blob': blobname, 'url': url_file})  
   
     # ★ ここを追加：アクティブなチャットIDの履歴を必ず Cosmos から読み直す  
     active_sid = session.get("current_session_id")  
@@ -1486,7 +1581,6 @@ def send_message():
     messages.append({"role": "user", "content": prompt, "type": "text"})  
     session["main_chat_messages"] = messages  
     session.modified = True  
-    # ※ save_chat_history() は呼ばない（Cosmos は assistant 保存時に更新）  
   
     try:  
         selected_index = session.get("selected_search_index", DEFAULT_SEARCH_INDEX)  
@@ -1636,6 +1730,48 @@ def send_message():
             effort = REASONING_EFFORT  
         enable_reasoning = model_to_use in REASONING_ENABLED_MODELS  
   
+        # OpenAI 呼び出し用パラメータ（デバッグにも使う）  
+        request_kwargs = dict(model=model_to_use, input=input_items, store=False)  
+        if enable_reasoning:  
+            request_kwargs["reasoning"] = {"effort": effort}  
+  
+        api_request_payload = {  
+            "model": model_to_use,  
+            "input": input_items,  
+            "store": False,  
+        }  
+        if enable_reasoning:  
+            api_request_payload["reasoning"] = {"effort": effort}  
+  
+        # OpenAI 呼び出し  
+        response = client.responses.create(**request_kwargs)  
+  
+        # レスポンスを dict に変換（そのままデバッグ表示用）  
+        try:  
+            if hasattr(response, "model_dump_json"):  
+                api_response_payload = json.loads(response.model_dump_json())  
+            else:  
+                api_response_payload = json.loads(str(response))  
+        except Exception:  
+            try:  
+                api_response_payload = json.loads(str(response))  
+            except Exception:  
+                api_response_payload = str(response)  
+  
+        # トークン数チェック（ローカル計算 vs usage.input_tokens）  
+        local_input_tokens = estimate_input_tokens(model_to_use, input_items)  
+        api_input_tokens = extract_usage_input_tokens(response, api_response_payload)  
+        token_diff = None  
+        if isinstance(local_input_tokens, int) and isinstance(api_input_tokens, int):  
+            token_diff = api_input_tokens - local_input_tokens  
+  
+        output_text = extract_output_text(response)  
+        assistant_html = markdown2.markdown(  
+            output_text or "",  
+            extras=["tables", "fenced-code-blocks", "code-friendly", "break-on-newline", "cuddled-lists"]  
+        ) or "<p>（応答テキストが空でした。もう一度お試しください）</p>"  
+        reasoning_summary = extract_reasoning_summary(response)  
+  
         # ------------ デバッグ情報作成 ------------  
         input_summary = []  
         try:  
@@ -1676,21 +1812,16 @@ def send_message():
             "attachment_images": image_filenames,  
             "attachment_files": file_filenames,  
             "input_summary": input_summary,  
+            "api_request": api_request_payload,  
+            "api_response": api_response_payload,  
+            "token_check": {  
+                "local_input_tokens": local_input_tokens,  
+                "api_input_tokens": api_input_tokens,  
+                "token_diff": token_diff,  
+                "note": "local_input_tokens は text 部分のみを tiktoken で数えた概算値で、画像/PDF やフォーマット上のオーバーヘッドは含んでいません。"  
+            },  
         }  
         # ------------ デバッグ情報ここまで ------------  
-  
-        # OpenAI 呼び出し  
-        request_kwargs = dict(model=model_to_use, input=input_items, store=False)  
-        if enable_reasoning:  
-            request_kwargs["reasoning"] = {"effort": effort}  
-  
-        response = client.responses.create(**request_kwargs)  
-        output_text = extract_output_text(response)  
-        assistant_html = markdown2.markdown(  
-            output_text or "",  
-            extras=["tables", "fenced-code-blocks", "code-friendly", "break-on-newline", "cuddled-lists"]  
-        ) or "<p>（応答テキストが空でした。もう一度お試しください）</p>"  
-        reasoning_summary = extract_reasoning_summary(response)  
   
         # ★ assistant を Cosmos に保存（ここで session と Cosmos の整合を取る）  
         persist_assistant_message(  
@@ -1778,7 +1909,6 @@ def stream_message():
     messages.append({"role": "user", "content": prompt, "type": "text"})  
     session["main_chat_messages"] = messages  
     session.modified = True  
-    # ※ save_chat_history() は呼ばない（Cosmos は assistant 保存時に更新）  
   
     selected_index = session.get("selected_search_index", DEFAULT_SEARCH_INDEX)  
     doc_count = max(1, min(300, int(session.get("doc_count", DEFAULT_DOC_COUNT))))  
@@ -1941,7 +2071,91 @@ def stream_message():
                         print("PDF添付Base64生成エラー:", e)  
                         traceback.print_exc()  
   
-            # ------------ デバッグ情報: モデルに渡す内容のサマリを送信 ------------  
+            # OpenAI Responses Streaming 用リクエスト  
+            request_kwargs = dict(model=model_to_use, input=input_items, store=False)  
+            if enable_reasoning:  
+                request_kwargs["reasoning"] = {"effort": effort}  
+  
+            api_request_payload = {  
+                "model": model_to_use,  
+                "input": input_items,  
+                "store": False,  
+            }  
+            if enable_reasoning:  
+                api_request_payload["reasoning"] = {"effort": effort}  
+  
+            # OpenAI Responses Streaming  
+            with client.responses.stream(**request_kwargs) as stream:  
+                for event in stream:  
+                    etype = getattr(event, "type", "")  
+                    if etype == "response.output_text.delta":  
+                        delta = getattr(event, "delta", "") or ""  
+                        if isinstance(delta, str) and delta:  
+                            result_holder["full_text"] += delta  
+                            q.put(_sse_event("delta", {"text": delta}))  
+                    elif etype.endswith(".delta"):  
+                        delta = getattr(event, "delta", "") or ""  
+                        if isinstance(delta, str) and delta:  
+                            result_holder["full_text"] += delta  
+                            q.put(_sse_event("delta", {"text": delta}))  
+                    elif etype == "response.error":  
+                        err = getattr(event, "error", None)  
+                        msg = str(err) if err else "unknown error"  
+                        result_holder["error"] = msg  
+                        q.put(_sse_event("error", {"message": msg}))  
+                final_response = stream.get_final_response()  
+  
+            # full_text が空なら final_response からテキスト抽出  
+            if not result_holder["full_text"]:  
+                try:  
+                    final_text = extract_output_text(final_response) or ""  
+                    if final_text:  
+                        result_holder["full_text"] = final_text  
+                        q.put(_sse_event("delta", {"text": final_text}))  
+                except Exception as e:  
+                    print("final_response からの出力抽出失敗:", e)  
+  
+            # レスポンスを dict に変換（そのままデバッグ表示用）  
+            try:  
+                if hasattr(final_response, "model_dump_json"):  
+                    api_response_payload = json.loads(final_response.model_dump_json())  
+                else:  
+                    api_response_payload = json.loads(str(final_response))  
+            except Exception:  
+                try:  
+                    api_response_payload = json.loads(str(final_response))  
+                except Exception:  
+                    api_response_payload = str(final_response)  
+  
+            # トークン数チェック  
+            local_input_tokens = estimate_input_tokens(model_to_use, input_items)  
+            api_input_tokens = extract_usage_input_tokens(final_response, api_response_payload)  
+            token_diff = None  
+            if isinstance(local_input_tokens, int) and isinstance(api_input_tokens, int):  
+                token_diff = api_input_tokens - local_input_tokens  
+  
+            result_holder["reasoning_summary"] = extract_reasoning_summary(final_response)  
+            full_text = result_holder["full_text"]  
+            assistant_html = markdown2.markdown(  
+                full_text or "",  
+                extras=["tables", "fenced-code-blocks", "code-friendly", "break-on-newline", "cuddled-lists"]  
+            ) or "<p>（応答テキストが空でした。もう一度お試しください）</p>"  
+            result_holder["assistant_html"] = assistant_html  
+  
+            # assistant を Cosmos に保存  
+            try:  
+                if full_text or assistant_html:  
+                    persist_assistant_message(  
+                        active_sid=active_sid,  
+                        assistant_html=assistant_html,  
+                        full_text=full_text,  
+                        system_message=system_message  
+                    )  
+            except Exception as e:  
+                print("SSE producer 履歴保存エラー:", e)  
+                traceback.print_exc()  
+  
+            # ------------ デバッグ情報: モデルに渡す内容＋レスポンス ------------  
             input_summary = []  
             try:  
                 for item in input_items:  
@@ -1981,63 +2195,17 @@ def stream_message():
                 "attachment_images": image_filenames,  
                 "attachment_files": file_filenames,  
                 "input_summary": input_summary,  
+                "api_request": api_request_payload,  
+                "api_response": api_response_payload,  
+                "token_check": {  
+                    "local_input_tokens": local_input_tokens,  
+                    "api_input_tokens": api_input_tokens,  
+                    "token_diff": token_diff,  
+                    "note": "local_input_tokens は text 部分のみを tiktoken で数えた概算値で、画像/PDF やフォーマット上のオーバーヘッドは含んでいません。"  
+                },  
             }  
             q.put(_sse_event("debug", debug_info))  
             # ------------ デバッグ情報ここまで ------------  
-  
-            # OpenAI Responses Streaming  
-            request_kwargs = dict(model=model_to_use, input=input_items, store=False)  
-            if enable_reasoning:  
-                request_kwargs["reasoning"] = {"effort": effort}  
-  
-            with client.responses.stream(**request_kwargs) as stream:  
-                for event in stream:  
-                    etype = getattr(event, "type", "")  
-                    if etype == "response.output_text.delta":  
-                        delta = getattr(event, "delta", "") or ""  
-                        if isinstance(delta, str) and delta:  
-                            result_holder["full_text"] += delta  
-                            q.put(_sse_event("delta", {"text": delta}))  
-                    elif etype.endswith(".delta"):  
-                        delta = getattr(event, "delta", "") or ""  
-                        if isinstance(delta, str) and delta:  
-                            result_holder["full_text"] += delta  
-                            q.put(_sse_event("delta", {"text": delta}))  
-                    elif etype == "response.error":  
-                        err = getattr(event, "error", None)  
-                        msg = str(err) if err else "unknown error"  
-                        result_holder["error"] = msg  
-                        q.put(_sse_event("error", {"message": msg}))  
-                final_response = stream.get_final_response()  
-  
-            if not result_holder["full_text"]:  
-                try:  
-                    final_text = extract_output_text(final_response) or ""  
-                    if final_text:  
-                        result_holder["full_text"] = final_text  
-                        q.put(_sse_event("delta", {"text": final_text}))  
-                except Exception as e:  
-                    print("final_response からの出力抽出失敗:", e)  
-            result_holder["reasoning_summary"] = extract_reasoning_summary(final_response)  
-            full_text = result_holder["full_text"]  
-            assistant_html = markdown2.markdown(  
-                full_text or "",  
-                extras=["tables", "fenced-code-blocks", "code-friendly", "break-on-newline", "cuddled-lists"]  
-            ) or "<p>（応答テキストが空でした。もう一度お試しください）</p>"  
-            result_holder["assistant_html"] = assistant_html  
-  
-            # assistant を Cosmos に保存  
-            try:  
-                if full_text or assistant_html:  
-                    persist_assistant_message(  
-                        active_sid=active_sid,  
-                        assistant_html=assistant_html,  
-                        full_text=full_text,  
-                        system_message=system_message  
-                    )  
-            except Exception as e:  
-                print("SSE producer 履歴保存エラー:", e)  
-                traceback.print_exc()  
   
             if result_holder["reasoning_summary"]:  
                 q.put(_sse_event("reasoning_summary", {"summary": result_holder["reasoning_summary"]}))  

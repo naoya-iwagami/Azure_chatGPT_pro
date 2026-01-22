@@ -68,7 +68,7 @@ html, body {
         justify-content: flex-start;  
 }  
 .message-bubble {  
-        max-width: 70%;  
+        max-width: 80%;           /* ★ 70% → 80% に拡大 */  
         padding: 10px;  
         border-radius: 15px;  
         word-wrap: break-word;  
@@ -183,19 +183,22 @@ html, body {
   
 /* デバッグ情報表示用 */  
 .debug-block {  
-        margin-top: 6px;  
+        margin-top: 8px;  
         font-size: 0.8em;  
         background: #fff3f3;  
         border-left: 3px solid #d9534f;  
-        padding: 4px 8px;  
-        max-height: 220px;  
+        padding: 8px 10px;  
+        max-height: 60vh;      /* ★ 高さを大きく（画面の 60% まで） */  
         overflow: auto;  
+        border-radius: 4px;  
 }  
 .debug-block > summary {  
         cursor: pointer;  
         font-weight: 600;  
 }  
 .debug-block pre {  
-        white-space: pre-wrap;  
+        white-space: pre;       /* インデントを保って横スクロール */  
         margin: 4px 0 0 0;  
+        font-size: 11px;  
+        line-height: 1.4;  
 }  
