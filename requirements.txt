@@ -10,3 +10,4 @@ markdown2==2.5.3
 gunicorn==23.0.0
 redis==6.0.0
 azure-identity==1.23.0
+tiktoken=0.12.0 
