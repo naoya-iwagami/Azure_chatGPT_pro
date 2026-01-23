@@ -6,6 +6,23 @@
   <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">  
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">  
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.css">  
+    
+  <!-- MathJax 設定 & 読み込み（LaTeX用） -->  
+  <script>  
+    window.MathJax = {  
+      tex: {  
+        // インライン数式: $...$  
+        inlineMath: [['$', '$']],  
+        // 別行数式: $$...$$ または $...$  
+        displayMath: [['$$', '$$'], ['\$', '\$']],  
+        processEscapes: true  
+      },  
+      svg: { fontCache: 'global' }  
+    };  
+  </script>  
+  <script id="MathJax-script" async  
+          src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>  
+    
   <style>  
     #loadingInline { display: none; align-items: center;}  
     #loadingInline .loading-text { font-size: 1rem; color: #333; margin-left: 0.5em;}  
@@ -58,7 +75,7 @@
           </small>  
         </div>  
       </form>  
-  
+    
       <h4>検索設定</h4>  
       <div class="small-muted">検索方法: ハイブリッド（キーワード＋セマンティック＋ベクターのRRF融合）</div>  
       <form method="POST" style="margin-bottom: 1em; margin-top: .5em;">  
@@ -75,7 +92,7 @@
           <input type="hidden" name="set_index" value="1">  
         </div>  
       </form>  
-  
+    
       <form method="POST" style="margin-bottom: 1em;">  
         <div class="form-group">  
           <label for="doc_count">取得ドキュメント数（1～300）</label>  
@@ -86,7 +103,7 @@
           <small class="form-text text-muted">多くするほど文脈は増えますが、応答時間も長くなります。</small>  
         </div>  
       </form>  
-  
+    
       <form method="POST" style="margin-bottom: 1em;">  
         <div class="form-group">  
           <label for="history_to_send">過去メッセージ数（1～50）</label>  
@@ -97,7 +114,7 @@
           <small class="form-text text-muted">モデルに渡す直近の発話数を指定します。</small>  
         </div>  
       </form>  
-  
+    
       <!-- RAG ON/OFF スイッチ -->  
       <div class="form-group">  
         <div class="custom-control custom-switch">  
@@ -109,17 +126,20 @@
           OFFにすると社内検索を行わず、会話と添付のみで回答します。  
         </small>  
       </div>  
-  
+    
       <h5>モデルに指示を与える</h5>  
       <!-- 現在のsystem_messageを直接編集 -->  
       <form method="POST" style="margin-bottom: 1em;">  
         <div class="form-group">  
           <textarea class="form-control" name="system_message" rows="4"  
-          >{{ session.get('default_system_message', 'あなたは親切なAIアシスタントです。ユーザーの質問が不明確な場合は、「こういうことですか？」と内容を確認してください。質問が明確な場合は、簡潔かつ正確に答えてください。') }}</textarea>  
+          >{{ session.get(  
+              'default_system_message',  
+              'あなたは親切なAIアシスタントです。ユーザーの質問が不明確な場合は、「こういうことですか？」と内容を確認してください。質問が明確な場合は、簡潔かつ正確に答えてください。数式を含む場合は LaTeX で表記し、インライン数式は $...$、ディスプレイ数式は $$...$$ または \$...\$ で囲んでください.'  
+          ) }}</textarea>  
           <input type="hidden" name="set_system_message" value="1">  
         </div>  
       </form>  
-  
+    
       <!-- 登録済みの指示から選ぶ -->  
       <form method="POST" style="margin-bottom: 1em;">  
         <div class="form-group">  
@@ -134,7 +154,7 @@
           <small class="form-text text-muted">選択すると、その内容がシステムメッセージに反映されます。</small>  
         </div>  
       </form>  
-  
+    
       <!-- 新しい指示を登録 -->  
       <h6>指示を登録</h6>  
       <form method="POST" style="margin-bottom: 1em;">  
@@ -149,7 +169,7 @@
         <button type="submit" class="btn btn-outline-primary">登録</button>  
         <input type="hidden" name="add_system_prompt" value="1">  
       </form>  
-  
+    
       <h4>チャット履歴</h4>  
       <ul class="chat-history" id="chatHistoryList">  
         {% if chat_sessions %}  
@@ -183,7 +203,7 @@
       <form method="POST">  
         <button type="submit" name="new_chat" value="true" class="btn btn-primary mt-2">新しいチャット</button>  
       </form>  
-  
+    
       <hr>  
       <h4>ファイルアップロード（画像・PDF）</h4>  
       <form method="POST" enctype="multipart/form-data">  
@@ -195,7 +215,7 @@
           <input type="hidden" name="upload_files" value="1">  
         </div>  
       </form>  
-  
+    
       {% if images %}  
       <h5>アップロード画像</h5>  
       {% for img in images %}  
@@ -209,7 +229,7 @@
         </div>  
       {% endfor %}  
       {% endif %}  
-  
+    
       {% if files %}  
       <h5>アップロードPDF</h5>  
       {% for f in files %}  
@@ -223,7 +243,7 @@
       {% endfor %}  
       {% endif %}  
     </div>  
-  
+    
     <!-- メインコンテンツ -->  
     <div class="col-md-9 main-content">  
       <div id="mainHeader" class="d-flex align-items-center justify-content-between mb-3">  
@@ -233,7 +253,7 @@
           <span class="loading-text">応答中です。しばらくお待ちください…</span>  
         </div>  
       </div>  
-  
+    
       {% with messages = get_flashed_messages() %}  
       {% if messages %}  
         <ul class="flashes">  
@@ -241,7 +261,7 @@
         </ul>  
       {% endif %}  
       {% endwith %}  
-  
+    
       <!-- チャット表示領域 -->  
       <div id="chatBox" class="chat-box">  
         {% for msg in chat_history %}  
@@ -262,10 +282,10 @@
           </div>  
         {% endfor %}  
       </div>  
-  
+    
       <!-- RAG文書表示欄 -->  
       <div id="searchFilesDisplay" class="alert alert-secondary" style="display:none;font-size:0.95em;"></div>  
-  
+    
       <!-- チャット入力欄 -->  
       <form id="chatForm" class="chat-input">  
         <div class="form-row">  
@@ -301,8 +321,18 @@ document.addEventListener('DOMContentLoaded', function() {
   document.getElementById('chatForm').addEventListener('submit', function() {  
     sessionStorage.removeItem('chat_input');  
   });  
-  
-  // ★ 会話IDの取得・更新ヘルパ  
+    
+  // MathJax で LaTeX を描画するヘルパー  
+  function typesetMath(el) {  
+    if (!el) return;  
+    if (window.MathJax && window.MathJax.typesetPromise) {  
+      MathJax.typesetPromise([el]).catch(function (err) {  
+        console.error('MathJax typeset error:', err);  
+      });  
+    }  
+  }  
+    
+  // 会話IDの取得・更新ヘルパ  
   const currentSessionEl = document.getElementById('currentSession');  
   function getCurrentSessionId() {  
     return currentSessionEl ? (currentSessionEl.dataset.sessionId || '') : '';  
@@ -312,31 +342,30 @@ document.addEventListener('DOMContentLoaded', function() {
       currentSessionEl.dataset.sessionId = sid || '';  
     }  
   }  
-  
+    
   const chatForm = document.getElementById('chatForm');  
   const chatBox = document.getElementById('chatBox');  
   const sendButton = document.getElementById('sendButton');  
   const loadingInline = document.getElementById('loadingInline');  
   const searchFilesDisplay = document.getElementById('searchFilesDisplay');  
   let currentSearchFiles = [];  
-  
+    
   let lastUserBubbleEl = null;  
-  // ★ 修正案B: 送信中フラグ  
-  let isSending = false;  
-  
+  let isSending = false;  // 送信中フラグ  
+    
   function scrollChatToBottom() { chatBox.scrollTop = chatBox.scrollHeight; }  
-  
+    
   function escapeHtml(str) {  
     if (!str) return '';  
     return str.replace(/[&<>"']/g, m => (  
       { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]  
     ));  
   }  
-  
+    
   function showLoading() { loadingInline.style.display = 'flex'; }  
   function hideLoading() { loadingInline.style.display = 'none'; }  
   hideLoading();  
-  
+    
   function appendUserMessage(message) {  
     const c = document.createElement('div');  
     c.className = 'message-container user';  
@@ -349,21 +378,21 @@ document.addEventListener('DOMContentLoaded', function() {
     lastUserBubbleEl = bubble;  
     return bubble;  
   }  
-  
-  // デバッグ情報をアシスタントメッセージの下に表示する  
+    
+  // デバッグ情報をアシスタントメッセージの下に表示  
   function appendDebugBlock(bubbleEl, title, debugObj) {  
     if (!bubbleEl || !debugObj) return;  
     try {  
       const details = document.createElement('details');  
       details.className = 'debug-block';  
-      details.open = false;  // 初期状態は閉じる  
-  
+      details.open = false;  
+    
       const summary = document.createElement('summary');  
       summary.textContent = title || '送信内容デバッグ';  
-  
+    
       const pre = document.createElement('pre');  
       pre.textContent = JSON.stringify(debugObj, null, 2);  
-  
+    
       details.appendChild(summary);  
       details.appendChild(pre);  
       bubbleEl.appendChild(details);  
@@ -372,7 +401,7 @@ document.addEventListener('DOMContentLoaded', function() {
       console.error('appendDebugBlock error:', e);  
     }  
   }  
-  
+    
   function renderRewrittenQueriesUnder(targetBubbleEl, payload) {  
     try {  
       if (!targetBubbleEl) return;  
@@ -380,13 +409,13 @@ document.addEventListener('DOMContentLoaded', function() {
         ? payload.queries.map(s => typeof s === 'string' ? s.trim() : '').filter(Boolean)  
         : [];  
       if (queries.length === 0) return;  
-  
+    
       const baseQuery = (typeof payload?.base_query === 'string' ? payload.base_query.trim() : '');  
       const clarify = payload?.needs_clarification === true;  
-  
+    
       const old = targetBubbleEl.querySelector('.rewritten-queries');  
       if (old) old.remove();  
-  
+    
       const wrap = document.createElement('div');  
       wrap.className = 'rewritten-queries';  
       const title = document.createElement('div');  
@@ -396,7 +425,7 @@ document.addEventListener('DOMContentLoaded', function() {
         : 'クエリリライト（検索に使用）';  
       const list = document.createElement('ul');  
       list.className = 'rq-list';  
-  
+    
       if (baseQuery && !queries.includes(baseQuery)) {  
         const li0 = document.createElement('li');  
         li0.textContent = baseQuery + '（基準）';  
@@ -407,16 +436,15 @@ document.addEventListener('DOMContentLoaded', function() {
         li.textContent = q;  
         list.appendChild(li);  
       });  
-  
+    
       wrap.appendChild(title);  
       wrap.appendChild(list);  
       targetBubbleEl.appendChild(wrap);  
       scrollChatToBottom();  
     } catch (_) {}  
   }  
-  
-  // アシスタント用メッセージコンテナを作成し、  
-  // 本文要素とバブル要素の両方を返す  
+    
+  // アシスタント用メッセージコンテナ  
   function appendAssistantStreamContainer() {  
     const c = document.createElement('div');  
     c.className = 'message-container assistant';  
@@ -430,19 +458,15 @@ document.addEventListener('DOMContentLoaded', function() {
     const bubbleEl = c.querySelector('.message-bubble');  
     return { msgEl, bubbleEl };  
   }  
-  
+    
   function replaceAssistantContainerHtml(targetEl, html) {  
-    if (targetEl) {  
-      targetEl.innerHTML = html;  
-    }  
+    if (targetEl) targetEl.innerHTML = html;  
   }  
-  
+    
   function updateAssistantContainerText(targetEl, text) {  
-    if (targetEl) {  
-      targetEl.textContent = text;  
-    }  
+    if (targetEl) targetEl.textContent = text;  
   }  
-  
+    
   function appendReasoningSummary(summary) {  
     if (summary && summary !== 'detailed') {  
       const c = document.createElement('div');  
@@ -452,14 +476,14 @@ document.addEventListener('DOMContentLoaded', function() {
       scrollChatToBottom();  
     }  
   }  
-  
+    
   function clearSearchFilesDisplay() {  
     searchFilesDisplay.style.display = "none";  
     searchFilesDisplay.innerHTML = "";  
     currentSearchFiles = [];  
   }  
-  
-  // ファイル名の右側にフォルダ名表示  
+    
+  // RAG 検索結果表示  
   function renderSearchFiles(files) {  
     if (!Array.isArray(files) || files.length === 0) {  
       clearSearchFilesDisplay();  
@@ -467,7 +491,7 @@ document.addEventListener('DOMContentLoaded', function() {
     }  
     searchFilesDisplay.style.display = 'block';  
     currentSearchFiles = files;  
-  
+    
     let title = `<span id="searchFilesToggle" style="cursor:pointer; text-decoration:underline;">この質問で検索に利用された文書</span>`;  
     let ul = `<div id="searchFilesUlContainer" style="display:none;" tabindex="0"><ul>`;  
     files.forEach((file, idx) => {  
@@ -483,7 +507,7 @@ document.addEventListener('DOMContentLoaded', function() {
       ul += `<li><span class="doc-num">${idx + 1}.</span> <a href="#" class="doclink" data-docidx="${idx}" style="text-decoration:underline; cursor:pointer">${escapeHtml(file.title)}</a>${folderText} ${dlBtn}</li>`;  
     });  
     ul += `</ul></div>`;  
-  
+    
     searchFilesDisplay.innerHTML = title + ul;  
     setTimeout(function(){  
       let toggler = document.getElementById('searchFilesToggle');  
@@ -496,7 +520,7 @@ document.addEventListener('DOMContentLoaded', function() {
       }  
     }, 50);  
   }  
-  
+    
   function extractTitleFromHtml(html, maxLen = 10) {  
     const tmp = document.createElement('div');  
     tmp.innerHTML = html || '';  
@@ -504,7 +528,7 @@ document.addEventListener('DOMContentLoaded', function() {
     if (!text) return '無題';  
     return text.length > maxLen ? text.slice(0, maxLen) + '…' : text;  
   }  
-  
+    
   function upsertSidebarItemById(sid, title) {  
     if (!sid) return;  
     const ul = document.getElementById('chatHistoryList');  
@@ -525,16 +549,17 @@ document.addEventListener('DOMContentLoaded', function() {
       if (btn) btn.textContent = title || '無題';  
     }  
   }  
-  
+    
+  // SSE ストリーミング  
   function startSSE(prompt) {  
     const { msgEl: streamEl, bubbleEl: assistantBubble } = appendAssistantStreamContainer();  
     let accText = '';  
-    let finished = false;  // 終了判定フラグ  
-  
+    let finished = false;  
+    
     sendButton.disabled = true;  
     showLoading();  
     clearSearchFilesDisplay();  
-  
+    
     fetch('/prepare_stream', {  
       method: 'POST',  
       headers: {'Content-Type': 'application/json'},  
@@ -549,12 +574,12 @@ document.addEventListener('DOMContentLoaded', function() {
     })  
     .then(({ message_id }) => {  
       if (!message_id) throw new Error('no message_id');  
-  
+    
       const sid = getCurrentSessionId();  
       const esUrl = '/stream_message?mid=' + encodeURIComponent(message_id)  
                   + (sid ? '&sid=' + encodeURIComponent(sid) : '');  
       const es = new EventSource(esUrl);  
-  
+    
       es.addEventListener('rewritten_queries', ev => {  
         try { renderRewrittenQueriesUnder(lastUserBubbleEl, JSON.parse(ev.data)); } catch (_) {}  
       });  
@@ -575,11 +600,15 @@ document.addEventListener('DOMContentLoaded', function() {
           const data = JSON.parse(ev.data);  
           if (data && typeof data.html === 'string') {  
             replaceAssistantContainerHtml(streamEl, data.html);  
+    
+            // LaTeX を描画  
+            typesetMath(streamEl);  
+    
             const title = extractTitleFromHtml(data.html, 10);  
-            const sid = data.session_id || getCurrentSessionId();  
-            if (sid) {  
-              upsertSidebarItemById(sid, title);  
-              setCurrentSessionId(sid);  
+            const sid2 = data.session_id || getCurrentSessionId();  
+            if (sid2) {  
+              upsertSidebarItemById(sid2, title);  
+              setCurrentSessionId(sid2);  
             }  
           }  
         } catch (_) {}  
@@ -592,8 +621,8 @@ document.addEventListener('DOMContentLoaded', function() {
           }  
         } catch (_) {}  
       });  
-  
-      // ★ debug イベント  
+    
+      // debug イベント  
       es.addEventListener('debug', ev => {  
         try {  
           const data = JSON.parse(ev.data);  
@@ -603,7 +632,7 @@ document.addEventListener('DOMContentLoaded', function() {
           console.error('SSE debug event error:', e);  
         }  
       });  
-  
+    
       es.addEventListener('error', ev => {  
         try { console.error('SSE error event:', JSON.parse(ev.data)); } catch (_) {}  
       });  
@@ -612,18 +641,16 @@ document.addEventListener('DOMContentLoaded', function() {
         es.close();  
         sendButton.disabled = false;  
         hideLoading();  
-        isSending = false;  // ★ 送信終了  
+        isSending = false;  
         scrollChatToBottom();  
       });  
       es.onerror = function(err) {  
         console.error('SSE connection error:', err);  
-        if (finished) {  
-          return;  
-        }  
+        if (finished) return;  
         es.close();  
         sendButton.disabled = false;  
         hideLoading();  
-        // isSending は fallbackJsonSubmit が finally で false に戻す  
+        // SSE失敗時は JSON フォールバック  
         fallbackJsonSubmit(prompt);  
       };  
     })  
@@ -631,16 +658,17 @@ document.addEventListener('DOMContentLoaded', function() {
       console.error(err);  
       sendButton.disabled = false;  
       hideLoading();  
-      isSending = false;  // ★ エラー時も解除  
+      isSending = false;  
       alert('送信に失敗しました');  
     });  
   }  
-  
+    
+  // 非ストリーミング JSON フォールバック  
   function fallbackJsonSubmit(prompt) {  
     sendButton.disabled = true;  
     showLoading();  
     clearSearchFilesDisplay();  
-  
+    
     fetch('/send_message', {  
       method: 'POST',  
       headers: {'Content-Type': 'application/json'},  
@@ -666,7 +694,10 @@ document.addEventListener('DOMContentLoaded', function() {
         chatBox.appendChild(c);  
         assistantEl = c.querySelector('.assistant-message');  
         bubbleEl = c.querySelector('.message-bubble');  
-  
+    
+        // LaTeX を描画  
+        typesetMath(assistantEl);  
+    
         const t = extractTitleFromHtml(data.response, 10);  
         const sid = data.session_id || getCurrentSessionId();  
         if (sid) {  
@@ -679,8 +710,7 @@ document.addEventListener('DOMContentLoaded', function() {
       } else {  
         clearSearchFilesDisplay();  
       }  
-  
-      // ★ 非ストリーミング時のデバッグ表示  
+    
       if (data.debug && bubbleEl) {  
         console.log('DEBUG from /send_message:', data.debug);  
         appendDebugBlock(bubbleEl, '送信内容デバッグ', data.debug);  
@@ -693,31 +723,30 @@ document.addEventListener('DOMContentLoaded', function() {
     .finally(() => {  
       sendButton.disabled = false;  
       hideLoading();  
-      isSending = false;  // ★ JSON完了時に解除  
+      isSending = false;  
       scrollChatToBottom();  
     });  
   }  
-  
+    
+  // フォーム送信ハンドラ  
   document.getElementById('chatForm').addEventListener('submit', e => {  
     e.preventDefault();  
-    if (isSending) {  
-      // ★ 連打やストリーミング中の送信を防止  
-      return;  
-    }  
+    if (isSending) return;  
     const prompt = promptTextarea.value.trim();  
     if (!prompt) return;  
-    isSending = true;  // ★ 送信開始  
+    isSending = true;  
     const bubble = appendUserMessage(prompt);  
     lastUserBubbleEl = bubble;  
     promptTextarea.value = '';  
-  
+    
     if (window.EventSource) {  
       startSSE(prompt);  
     } else {  
       fallbackJsonSubmit(prompt);  
     }  
   });  
-  
+    
+  // RAG文書クリック時のモーダル表示  
   searchFilesDisplay.addEventListener('click', function(e) {  
     if (e.target && e.target.classList.contains('doclink')) {  
       e.preventDefault();  
@@ -742,7 +771,8 @@ document.addEventListener('DOMContentLoaded', function() {
       }  
     }  
   });  
-  
+    
+  // Enter で送信（Shift+Enter は改行）  
   const promptTextareaEl = document.getElementById('promptTextarea');  
   promptTextareaEl.addEventListener('keydown', e => {  
     if (e.key==='Enter' && !e.shiftKey) {  
@@ -750,9 +780,14 @@ document.addEventListener('DOMContentLoaded', function() {
       document.getElementById('chatForm').dispatchEvent(new Event('submit'));  
     }  
   });  
-  
+    
+  // 初期スクロール  
   (function(){ chatBox.scrollTop = chatBox.scrollHeight; })();  
-  
+    
+  // 初期表示の履歴メッセージを MathJax でレンダリング  
+  typesetMath(chatBox);  
+    
+  // 設定を /update_settings に送る共通関数  
   function postSettings(payload) {  
     return fetch('/update_settings', {  
       method: 'POST',  
@@ -763,7 +798,8 @@ document.addEventListener('DOMContentLoaded', function() {
       return r.json();  
     }).catch(e => console.error(e));  
   }  
-  
+    
+  // モデル選択・reasoning_effort  
   const modelSelect = document.getElementById('model_select');  
   const reasoningEffortSelect = document.getElementById('reasoning_effort');  
   function updateReasoningSelectState(model) {  
@@ -784,14 +820,16 @@ document.addEventListener('DOMContentLoaded', function() {
       postSettings({ reasoning_effort: this.value });  
     });  
   }  
-  
+    
+  // インデックス選択  
   const indexSelect = document.getElementById('index_select');  
   if (indexSelect) {  
     indexSelect.addEventListener('change', function() {  
       postSettings({ selected_search_index: this.value });  
     });  
   }  
-  
+    
+  // doc_count  
   const docCountInput = document.getElementById('doc_count');  
   if (docCountInput) {  
     docCountInput.addEventListener('change', function() {  
@@ -799,7 +837,8 @@ document.addEventListener('DOMContentLoaded', function() {
       postSettings({ doc_count: isNaN(v) ? 10 : v });  
     });  
   }  
-  
+    
+  // history_to_send  
   const histInput = document.getElementById('history_to_send');  
   if (histInput) {  
     histInput.addEventListener('change', function() {  
@@ -807,14 +846,16 @@ document.addEventListener('DOMContentLoaded', function() {
       postSettings({ history_to_send: isNaN(v) ? 10 : v });  
     });  
   }  
-  
+    
+  // system_message（blur時に保存）  
   const sysMsgTextarea = document.querySelector('textarea[name="system_message"]');  
   if (sysMsgTextarea) {  
     sysMsgTextarea.addEventListener('blur', function() {  
       postSettings({ default_system_message: this.value });  
     });  
   }  
-  
+    
+  // RAG スイッチ  
   const ragSwitch = document.getElementById('ragEnabled');  
   if (ragSwitch) {  
     ragSwitch.addEventListener('change', function() {  
@@ -830,12 +871,12 @@ document.addEventListener('DOMContentLoaded', function() {
   if (!('sendBeacon' in navigator)) { return; }  
   const KEY = 'pmc_active_tabs';  
   let cleaned = false;  
-  
+    
   function get() { try { return parseInt(localStorage.getItem(KEY) || '0', 10) || 0; } catch (e) { return 0; } }  
   function set(v) { try { localStorage.setItem(KEY, String(v)); } catch (e) {} }  
   function inc() { set(get() + 1); }  
   function dec() { const v = Math.max(0, get() - 1); set(v); return v; }  
-  
+    
   function sendCleanupOnce() {  
     if (cleaned) return;  
     cleaned = true;  
@@ -846,7 +887,7 @@ document.addEventListener('DOMContentLoaded', function() {
       navigator.sendBeacon('{{ url_for("cleanup_session_files") }}', blob);  
     }  
   }  
-  
+    
   window.addEventListener('pageshow', inc, { once: true });  
   window.addEventListener('pagehide', sendCleanupOnce, { capture: true });  
   window.addEventListener('beforeunload', sendCleanupOnce);  

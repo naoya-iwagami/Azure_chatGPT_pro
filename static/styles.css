@@ -68,7 +68,7 @@ html, body {
         justify-content: flex-start;  
 }  
 .message-bubble {  
-        max-width: 80%;           /* ★ 70% → 80% に拡大 */  
+        max-width: 80%;           /* 70% → 80% に拡大 */  
         padding: 10px;  
         border-radius: 15px;  
         word-wrap: break-word;  
@@ -188,7 +188,7 @@ html, body {
         background: #fff3f3;  
         border-left: 3px solid #d9534f;  
         padding: 8px 10px;  
-        max-height: 60vh;      /* ★ 高さを大きく（画面の 60% まで） */  
+        max-height: 60vh;      /* 高さを大きく（画面の 60% まで） */  
         overflow: auto;  
         border-radius: 4px;  
 }  

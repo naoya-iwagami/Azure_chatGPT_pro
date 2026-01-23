@@ -48,8 +48,7 @@ from azure.identity import AzureCliCredential, ManagedIdentityCredential
 try:  
     import tiktoken  
 except ImportError:  
-    tiktoken = None  
-
+    tiktoken = None    
   
 # ------------------------------- アプリ環境/Flask -------------------------------  
 APP_ENV = os.getenv("APP_ENV", "prod").lower()  
@@ -68,6 +67,7 @@ Session(app)
 # この版ではSASは使用せず、常に中継を使用するため、この設定値に関わらず中継を使います。  
 USE_SAS_LINKS = os.getenv("USE_SAS_LINKS", "true" if IS_LOCAL else "false").lower() == "true"  
   
+  
 # ------------------------------- Azure Identity 認証 -------------------------------  
 def build_credential():  
     if IS_LOCAL:  
@@ -75,14 +75,18 @@ def build_credential():
     mi_client_id = os.getenv("AZURE_CLIENT_ID")  
     return ManagedIdentityCredential(client_id=mi_client_id) if mi_client_id else ManagedIdentityCredential()  
   
+  
 credential = build_credential()  
+  
   
 def build_azure_ad_token_provider(credential, scope):  
     def _provider():  
         return credential.get_token(scope).token  
     return _provider  
   
+  
 aad_token_provider = build_azure_ad_token_provider(credential, "https://cognitiveservices.azure.com/.default")  
+  
   
 # ------------------------------- Azure OpenAI クライアント設定（AAD） -------------------------------  
 # メインの Responses API クライアント（Entra ID 認証）  
@@ -100,6 +104,7 @@ embed_client = AzureOpenAI(
     api_version="2025-04-01-preview",  
     azure_ad_token_provider=aad_token_provider,  
 )  
+  
   
 # ------------------------------- モデル・検索設定 -------------------------------  
 RESPONSES_MODEL = os.getenv("AZURE_OPENAI_RESPONSES_MODEL", "gpt-4o")  
@@ -128,6 +133,7 @@ MIN_UNIQUE_PARENTS_ABS = int(os.getenv("MIN_UNIQUE_PARENTS_ABS", "3"))
   
 # 添付の最大バイト（超過時は添付スキップ）  
 MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(30 * 1024 * 1024)))  # 30MB  
+  
   
 # ------------------------------- Azure サービスクライアント（AAD） -------------------------------  
 search_service_endpoint = os.getenv("AZURE_SEARCH_ENDPOINT")  
@@ -207,13 +213,16 @@ INDEX_LANG = {
     "quality-assurance": "ja",  
 }  
   
+  
 def to_query_language(lang: str) -> str:  
     return "ja-JP" if (lang or "").lower().startswith("ja") else "en-US"  
+  
   
 lock = threading.Lock()  
   
 # ====== ダウンロード用の検証（緩和版） ======  
 ALLOWED_CONTAINERS_FOR_DOWNLOAD = set(INDEX_TO_BLOB_CONTAINER.values()) | {image_container_name, file_container_name}  
+  
   
 def validate_blob_path(blobname: str):  
     # パストラバーサル/絶対パス/制御文字/バックスラッシュは拒否。その他（日本語・括弧など）は許容。  
@@ -222,10 +231,12 @@ def validate_blob_path(blobname: str):
     if re.search(r'[\x00-\x1f\x7f]', blobname) or "\\" in blobname:  
         abort(400)  
   
+  
 def validate_container_and_path(container: str, blobname: str):  
     if container not in ALLOWED_CONTAINERS_FOR_DOWNLOAD:  
         abort(403)  
     validate_blob_path(blobname)  
+  
   
 # 追加: blobname 正規化（最大2回のunquote）  
 def normalize_blobname(s: str) -> str:  
@@ -235,6 +246,7 @@ def normalize_blobname(s: str) -> str:
         return twice if twice != once else once  
     except Exception:  
         return s  
+  
   
 # ------------------------------- ユーティリティ -------------------------------  
 def generate_sas_url(blob_client, blob_name):  
@@ -263,6 +275,7 @@ def generate_sas_url(blob_client, blob_name):
         print("SAS/UDK 発行失敗:", e)  
         return ""  
   
+  
 def build_download_url(container_name: str, blobname: str, is_text: bool) -> str:  
     """  
     一元的なダウンロードURL生成（常にアプリ中継）。  
@@ -274,6 +287,7 @@ def build_download_url(container_name: str, blobname: str, is_text: bool) -> str
         return url_for('download_txt', container=container_name, blobname=quote(blobname))  
     return url_for('download_blob', container=container_name, blobname=quote(blobname))  
   
+  
 def make_blob_url(container_name: str, blobname: str) -> str:  
     """  
     画像/PDFの表示用 URL を生成（常にアプリ中継の inline 表示）。  
@@ -283,15 +297,18 @@ def make_blob_url(container_name: str, blobname: str) -> str:
     except Exception:  
         return ""  
   
+  
 def encode_image_from_blob(blob_client):  
     downloader = blob_client.download_blob()  
     image_bytes = downloader.readall()  
     return base64.b64encode(image_bytes).decode('utf-8')  
   
+  
 def encode_pdf_from_blob(blob_client):  
     downloader = blob_client.download_blob()  
     pdf_bytes = downloader.readall()  
     return base64.b64encode(pdf_bytes).decode('utf-8')  
+  
   
 def strip_html_tags(html: str) -> str:  
     if not html:  
@@ -300,6 +317,7 @@ def strip_html_tags(html: str) -> str:
     html = re.sub(r'</p\s*>', '\n', html, flags=re.I)  
     text = re.sub(r'<[^>]+>', '', html)  
     return text  
+  
   
 # ------------------------------- トークナイズ関連 -------------------------------  
 def _get_encoding_for_model(model_name: str):  
@@ -331,7 +349,7 @@ def estimate_input_tokens(model_name: str, input_items: list):
   
     - text 系コンテンツ (input_text / output_text / text) だけを対象  
     - 画像 (input_image) や PDF (input_file) はトークン数に含めない  
-      → その分、モデルの usage.input_tokens より少なめに出る  
+       → その分、モデルの usage.input_tokens より少なめに出る  
     """  
     if not input_items:  
         return 0  
@@ -390,6 +408,7 @@ def extract_usage_input_tokens(resp_obj, resp_payload):
   
     return None  
   
+  
 # ------------------------------- その他ユーティリティ -------------------------------  
 def compute_first_assistant_title(messages, limit=30) -> str:  
     try:  
@@ -406,6 +425,7 @@ def compute_first_assistant_title(messages, limit=30) -> str:
     except Exception:  
         pass  
     return ""  
+  
   
 def extract_reasoning_summary(resp) -> str:  
     try:  
@@ -434,6 +454,7 @@ def extract_reasoning_summary(resp) -> str:
         print("Reasoning summary 取得エラー:", e)  
     return ""  
   
+  
 def extract_output_text(resp) -> str:  
     try:  
         if hasattr(resp, "output_text") and resp.output_text:  
@@ -461,6 +482,7 @@ def extract_output_text(resp) -> str:
         traceback.print_exc()  
         return ""  
   
+  
 def is_azure_blob_url(u: str) -> bool:  
     if not u:  
         return False  
@@ -472,6 +494,7 @@ def is_azure_blob_url(u: str) -> bool:
         return (".blob.core.windows.net" in host) or host.startswith("127.0.0.1") or host.startswith("localhost")  
     except Exception:  
         return False  
+  
   
 def resolve_blob_from_filepath(selected_index: str, path_or_url: str):  
     """  
@@ -501,6 +524,7 @@ def resolve_blob_from_filepath(selected_index: str, path_or_url: str):
         blobname = blobname[len(container_name2) + 1:]  
     return container_name2, blobname  
   
+  
 def resolve_container_blob_from_result(selected_index: str, result):  
     """  
     Search結果から (container, blobname) を頑健に復元する。  
@@ -517,6 +541,7 @@ def resolve_container_blob_from_result(selected_index: str, result):
         return resolve_blob_from_filepath(selected_index, fp)  
     return (None, None)  
   
+  
 # 追加: フォルダ名抽出（タイトルの右側に表示するため）  
 def extract_folder_from_blobname(blobname: str) -> str:  
     if not blobname:  
@@ -525,6 +550,7 @@ def extract_folder_from_blobname(blobname: str) -> str:
     if "/" not in p:  
         return ""  
     return p.rsplit("/", 1)[0]  
+  
   
 def extract_folder_from_result(selected_index: str, result) -> str:  
     try:  
@@ -549,6 +575,7 @@ def extract_folder_from_result(selected_index: str, result) -> str:
         pass  
     return ""  
   
+  
 # ------------------------------- クエリリライト -------------------------------  
 def rewrite_queries_for_search_responses(messages: list, current_prompt: str, system_message: str = "") -> list:  
     max_query_history_turns = min(3, MAX_REWRITE_TURNS)  
@@ -569,20 +596,20 @@ def rewrite_queries_for_search_responses(messages: list, current_prompt: str, sy
     context = "\n".join(history_lines)  
   
     system_prompt = (  
-    "あなたは社内文書検索クエリ生成AIです。\n"  
-    "出力仕様: {\"queries\":[\"...\", \"...\"]} の JSON を 1 行だけ返す。\n"  
-    "・各クエリは30文字以内、日本語主体、必要なら英語同義語併記。\n"  
-    "・最大4件生成。\n"  
-    "・複数クエリを出すときは、互いにできるだけ異なる観点やキーワード構成にしてください。\n"  
-    "・同じ単語を並べ替えただけ、助詞だけを変えただけなど、意味がほぼ同じクエリは生成しないでください。\n"  
-    "・意味が大きく変わる候補が2〜3件しか思いつかない場合は、その件数だけで構いません。\n"  
-    "・説明・前後の余分な文字・改行は禁止。"  
+        "あなたは社内文書検索クエリ生成AIです。\n"  
+        "出力仕様: {\"queries\":[\"...\", \"...\"]} の JSON を 1 行だけ返す。\n"  
+        "・各クエリは30文字以内、日本語主体、必要なら英語同義語併記。\n"  
+        "・最大4件生成。\n"  
+        "・複数クエリを出すときは、互いにできるだけ異なる観点やキーワード構成にしてください。\n"  
+        "・同じ単語を並べ替えただけ、助詞だけを変えただけなど、意味がほぼ同じクエリは生成しないでください。\n"  
+        "・意味が大きく変わる候補が2〜3件しか思いつかない場合は、その件数だけで構いません。\n"  
+        "・説明・前後の余分な文字・改行は禁止。"  
     )  
     user_prompt = (  
-    f"history{{{context}}}\n"  
-    "endtask ユーザの意図をよく表す文書検索用クエリを最大4件生成してください。\n"  
-    "可能であれば、表現や観点が少しずつ異なるクエリを含めてください。\n"  
-    f"最新ユーザ質問: {current_prompt}"  
+        f"history{{{context}}}\n"  
+        "endtask ユーザの意図をよく表す文書検索用クエリを最大4件生成してください。\n"  
+        "可能であれば、表現や観点が少しずつ異なるクエリを含めてください。\n"  
+        f"最新ユーザ質問: {current_prompt}"  
     )  
   
     input_items = [  
@@ -616,6 +643,7 @@ def rewrite_queries_for_search_responses(messages: list, current_prompt: str, sy
         qs = [current_prompt.strip()[:30] or "検索"]  
     return qs  
   
+  
 # ------------------------------- 認証/履歴等 -------------------------------  
 def get_authenticated_user():  
     if "user_id" in session and "user_name" in session:  
@@ -643,12 +671,14 @@ def get_authenticated_user():
     session["user_name"] = "anonymous"  
     return session["user_id"]  
   
+  
 def compute_has_assistant(msgs: list) -> bool:  
     return any(  
         (m.get("role") == "assistant") and  
         ((m.get("text") or strip_html_tags(m.get("content", ""))).strip())  
         for m in (msgs or [])  
     )  
+  
   
 def ensure_messages_from_cosmos(active_sid: str) -> list:  
     if not (container and active_sid):  
@@ -660,6 +690,7 @@ def ensure_messages_from_cosmos(active_sid: str) -> list:
             return item.get("messages", []) or []  
         except Exception:  
             return []  
+  
   
 def merge_messages(existing: list, new: list) -> list:  
     existing = existing or []  
@@ -684,6 +715,7 @@ def merge_messages(existing: list, new: list) -> list:
             seen.add(key)  
             merged.append(m)  
     return merged  
+  
   
 def persist_assistant_message(active_sid: str, assistant_html: str, full_text: str, system_message: str):  
     if not active_sid:  
@@ -755,6 +787,7 @@ def persist_assistant_message(active_sid: str, assistant_html: str, full_text: s
             print("persist_assistant_message 保存エラー:", e)  
             traceback.print_exc()  
   
+  
 def save_chat_history():  
     """  
     互換性維持のために残していますが、  
@@ -764,6 +797,7 @@ def save_chat_history():
     if not container:  
         return  
     # 必要なら将来用に実装を追加  
+  
   
 def load_chat_history():  
     if not container:  
@@ -803,8 +837,8 @@ def load_chat_history():
             traceback.print_exc()  
         return sidebar_messages  
   
-# ★★★★★ ここから systemprompts_1 用のコード ★★★★★  
   
+# ★★★★★ ここから systemprompts_1 用のコード ★★★★★  
 def save_system_prompt_item(title: str, content: str):  
     """  
     システムプロンプトの保存先を systemprompts_1 コンテナに変更  
@@ -830,6 +864,7 @@ def save_system_prompt_item(title: str, content: str):
             print("システムプロンプト保存エラー:", e)  
             traceback.print_exc()  
             return None  
+  
   
 def load_system_prompts():  
     """  
@@ -865,6 +900,7 @@ def load_system_prompts():
             traceback.print_exc()  
         return prompts  
   
+  
 def delete_system_prompt(prompt_id: str):  
     """  
     systemprompts_1 コンテナからシステムプロンプトを削除  
@@ -881,8 +917,8 @@ def delete_system_prompt(prompt_id: str):
             traceback.print_exc()  
             return False  
   
-# ★★★★★ systemprompts_1 関連ここまで ★★★★★  
   
+# ★★★★★ systemprompts_1 関連ここまで ★★★★★  
 def start_new_chat():  
     image_filenames = session.get("image_filenames", [])  
     for img_name in image_filenames:  
@@ -907,6 +943,7 @@ def start_new_chat():
     session["main_chat_messages"] = []  
     session.modified = True  
   
+  
 # ------------------------------- Azure Cognitive Search -------------------------------  
 def get_search_client(index_name):  
     return SearchClient(  
@@ -915,6 +952,7 @@ def get_search_client(index_name):
         credential=credential,  
         api_version="2024-07-01",  
     )  
+  
   
 def keyword_search(query, topNDocuments, index_name):  
     sc = get_search_client(index_name)  
@@ -927,6 +965,7 @@ def keyword_search(query, topNDocuments, index_name):
         top=topNDocuments,  
     )  
     return list(results)  
+  
   
 def keyword_semantic_search(query, topNDocuments, index_name, strictness=0.0):  
     sc = get_search_client(index_name)  
@@ -952,6 +991,7 @@ def keyword_semantic_search(query, topNDocuments, index_name, strictness=0.0):
     filtered.sort(key=lambda x: x.get("@search.rerankerScore", x.get("@search.score", 0.0)), reverse=True)  
     return filtered  
   
+  
 def get_query_embedding(query):  
     try:  
         resp = embed_client.embeddings.create(model=EMBEDDING_MODEL, input=query, dimensions=1536)  
@@ -960,6 +1000,7 @@ def get_query_embedding(query):
         print("Embedding 生成エラー:", e)  
         traceback.print_exc()  
         return []  
+  
   
 def keyword_vector_search(query, topNDocuments, index_name):  
     try:  
@@ -989,6 +1030,7 @@ def keyword_vector_search(query, topNDocuments, index_name):
         print("ベクター検索エラー:", e)  
         traceback.print_exc()  
         return []  
+  
   
 def hybrid_search_multiqueries(queries, topNDocuments, index_name, strictness=0.0):  
     rrf_k = 60  
@@ -1032,6 +1074,7 @@ def hybrid_search_multiqueries(queries, topNDocuments, index_name, strictness=0.
         fused_results.append(r)  
     return fused_results  
   
+  
 def rrf_fuse_ranked_lists(lists_of_results, topNDocuments):  
     rrf_k = 60  
     fusion_scores = {}  
@@ -1054,9 +1097,9 @@ def rrf_fuse_ranked_lists(lists_of_results, topNDocuments):
     fused_results = []  
     for k in sorted_keys[:req_top]:  
         r = fusion_docs[k]  
-        r["fusion_score"] = fusion_scores[k]  
         fused_results.append(r)  
     return fused_results  
+  
   
 # ------------------------------- HyDE / PRF -------------------------------  
 def hyde_paragraph(user_input: str) -> str:  
@@ -1075,6 +1118,7 @@ def hyde_paragraph(user_input: str) -> str:
     )  
     return (extract_output_text(resp) or "").strip()  
   
+  
 def refine_query_with_prf(initial_query: str, titles: list) -> str:  
     t = "\n".join(f"- {x}" for x in (titles or [])[:8])  
     prompt = f"""初回検索の上位文書のタイトル一覧です。これを参考に、より適合度の高い検索クエリを日本語で1本だけ生成。不要語は削除し、重要語は維持。出力はクエリ文字列のみ。タイトル:{t}  初回クエリ: {initial_query}"""  
@@ -1091,8 +1135,10 @@ def refine_query_with_prf(initial_query: str, titles: list) -> str:
     )  
     return (extract_output_text(resp) or "").strip().strip('「」\' ')  
   
+  
 def unique_parents(results):  
     return len({(r.get("parent_id") or r.get("filepath") or r.get("title")) for r in (results or [])})  
+  
   
 # ------------------------------- Responses 入力構築 -------------------------------  
 def build_responses_input_with_history(  
@@ -1154,6 +1200,7 @@ def build_responses_input_with_history(
   
     return input_items, last_user_index  
   
+  
 # ------------------------------- セッション内ファイル一括削除 -------------------------------  
 def _delete_uploaded_files_for_session():  
     deleted = {"images": [], "files": []}  
@@ -1182,10 +1229,12 @@ def _delete_uploaded_files_for_session():
         print("セッションファイル一括削除エラー:", e)  
     return deleted  
   
+  
 @app.route('/cleanup_session_files', methods=['POST'])  
 def cleanup_session_files():  
     result = _delete_uploaded_files_for_session()  
     return jsonify({"ok": True, "deleted": result})  
+  
   
 # ------------------------------- 設定更新（AJAX） -------------------------------  
 @app.route('/update_settings', methods=['POST'])  
@@ -1245,6 +1294,7 @@ def update_settings():
     session.modified = True  
     return jsonify({"ok": True, "changed": changed})  
   
+  
 # ------------------------------- ルーティング -------------------------------  
 @app.route('/', methods=['GET', 'POST'])  
 def index():  
@@ -1262,10 +1312,12 @@ def index():
     if "history_to_send" not in session:  
         session["history_to_send"] = max(1, min(50, int(MAX_HISTORY_TO_SEND)))  
     if "default_system_message" not in session:  
+        # ★★★ ここを LaTeX 指示入りに修正 ★★★  
         session["default_system_message"] = (  
             "あなたは親切なAIアシスタントです。ユーザーの質問が不明確な場合は、"  
             "「こういうことですか？」と内容を確認してください。質問が明確な場合は、"  
-            "簡潔かつ正確に答えてください。"  
+            "簡潔かつ正確に答えてください。数式を含む場合は LaTeX で表記し、"  
+            "インライン数式は $...$、ディスプレイ数式は $$...$$ または \\$...\\$ で囲んでください。" 
         )  
   
     # 毎回 Cosmos から履歴を再同期（空セッション非表示）  
@@ -1512,6 +1564,7 @@ def index():
         saved_prompts=saved_prompts  
     )  
   
+  
 # ------------------------------- 準備/送信/SSE -------------------------------  
 @app.route('/prepare_stream', methods=['POST'])  
 def prepare_stream():  
@@ -1531,6 +1584,7 @@ def prepare_stream():
     session['prepared_prompts'] = prepared  
     session.modified = True  
     return jsonify({"message_id": mid})  
+  
   
 @app.route('/send_message', methods=['POST'])  
 def send_message():  
@@ -1861,8 +1915,10 @@ def send_message():
             {'Content-Type': 'application/json'}  
         )  
   
+  
 def _sse_event(event_name: str, data_obj) -> str:  
     return f"event: {event_name}\ndata: {json.dumps(data_obj, ensure_ascii=False)}\n\n"  
+  
   
 @app.route('/stream_message', methods=['GET'])  
 def stream_message():  
@@ -2249,6 +2305,7 @@ def stream_message():
     }  
     return app.response_class(stream_with_context(generate()), headers=headers)  
   
+  
 # ------------------------------- テキスト Blob ダウンロード（attachment） -------------------------------  
 @app.route("/download_txt/<container>/<path:blobname>")  
 def download_txt(container, blobname):  
@@ -2294,6 +2351,7 @@ def download_txt(container, blobname):
         traceback.print_exc()  
         return (f"Unexpected error: {e}", 500)  
   
+  
 # ------------------------------- バイナリ Blob ダウンロード（attachment） -------------------------------  
 @app.route("/download_blob/<container>/<path:blobname>")  
 def download_blob(container, blobname):  
@@ -2324,6 +2382,7 @@ def download_blob(container, blobname):
         traceback.print_exc()  
         return (f"Unexpected error: {e}", 500)  
   
+  
 # ------------------------------- Blob inline 表示（画像/PDF等） -------------------------------  
 @app.route("/view_blob/<container>/<path:blobname>")  
 def view_blob(container, blobname):  
@@ -2337,7 +2396,8 @@ def view_blob(container, blobname):
         bc = blob_service_client.get_blob_client(container=container, blob=blobname)  
         data = bc.download_blob().readall()  
         content_type = mimetypes.guess_type(blobname)[0] or "application/octet-stream"  
-        return send_file(io.BytesIO(data), as_attachment=False, download_name=os.path.basename(blobname), mimetype=content_type)  
+        return send_file(io.BytesIO(data), as_attachment=False,  
+                         download_name=os.path.basename(blobname), mimetype=content_type)  
     except ResourceNotFoundError:  
         return ("Not Found", 404)  
     except ClientAuthenticationError:  
@@ -2349,6 +2409,7 @@ def view_blob(container, blobname):
         print("Unexpected blob view error:", e)  
         traceback.print_exc()  
         return (f"Unexpected error: {e}", 500)  
+  
   
 # ------------------------------- エントリポイント -------------------------------  
 if __name__ == '__main__':  
