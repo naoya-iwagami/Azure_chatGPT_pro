@@ -82,6 +82,7 @@ credential = build_credential()
 def build_azure_ad_token_provider(credential, scope):  
     def _provider():  
         return credential.get_token(scope).token  
+  
     return _provider  
   
   
@@ -323,6 +324,7 @@ def strip_html_tags(html: str) -> str:
 def _get_encoding_for_model(model_name: str):  
     """  
     モデル名から適切そうな tiktoken encoding を取得する。  
+  
     Azure のモデル名でも動くように、fallback を多めにしています。  
     """  
     if tiktoken is None:  
@@ -690,6 +692,27 @@ def ensure_messages_from_cosmos(active_sid: str) -> list:
             return item.get("messages", []) or []  
         except Exception:  
             return []  
+  
+  
+def update_cosmos_system_message(active_sid: str, new_sys_msg: str):  
+    """  
+    現在のチャットセッションの system_message を Cosmos に即時反映する。  
+    ドキュメントがまだ存在しない（最初の応答前など）場合は何もしない。  
+    """  
+    if not (container and active_sid):  
+        return  
+    with lock:  
+        try:  
+            user_id = get_authenticated_user()  
+            item = container.read_item(item=active_sid, partition_key=user_id)  
+            item["system_message"] = new_sys_msg  
+            container.upsert_item(item)  
+        except ResourceNotFoundError:  
+            # まだこの session_id のチャットが保存されていない場合は無視  
+            pass  
+        except Exception as e:  
+            print("system_message 更新エラー:", e)  
+            traceback.print_exc()  
   
   
 def merge_messages(existing: list, new: list) -> list:  
@@ -1285,6 +1308,8 @@ def update_settings():
                     sb[i]["system_message"] = sys_msg  
                     session["sidebar_messages"] = sb  
                     break  
+            # ★ Cosmos の system_message も更新  
+            update_cosmos_system_message(active_sid, sys_msg)  
         changed["default_system_message"] = sys_msg  
     if "rag_enabled" in data:  
         raw = data.get("rag_enabled")  
@@ -1317,7 +1342,7 @@ def index():
             "あなたは親切なAIアシスタントです。ユーザーの質問が不明確な場合は、"  
             "「こういうことですか？」と内容を確認してください。質問が明確な場合は、"  
             "簡潔かつ正確に答えてください。数式を含む場合は LaTeX で表記し、"  
-            "インライン数式は $...$、ディスプレイ数式は $$...$$ または \\$...\\$ で囲んでください。" 
+            "インライン数式は $...$、ディスプレイ数式は $$...$$ または \\$...\\$ で囲んでください。"  
         )  
   
     # 毎回 Cosmos から履歴を再同期（空セッション非表示）  
@@ -1383,6 +1408,8 @@ def index():
                         sb[i]["system_message"] = sys_msg  
                         session["sidebar_messages"] = sb  
                         break  
+                # ★ Cosmos も更新  
+                update_cosmos_system_message(active_sid, sys_msg)  
             session.modified = True  
             return redirect(url_for('index'))  
   
@@ -1391,15 +1418,18 @@ def index():
             saved = session.get("saved_prompts", [])  
             match = next((p for p in saved if p.get("id") == prompt_id), None)  
             if match:  
-                session["default_system_message"] = match.get("content", "")  
+                sys_msg = match.get("content", "")  
+                session["default_system_message"] = sys_msg  
                 active_sid = session.get("current_session_id")  
                 sb = session.get("sidebar_messages", [])  
                 if active_sid:  
                     for i, chat in enumerate(sb):  
                         if chat.get("session_id") == active_sid:  
-                            sb[i]["system_message"] = session["default_system_message"]  
+                            sb[i]["system_message"] = sys_msg  
                             session["sidebar_messages"] = sb  
                             break  
+                    # ★ Cosmos も更新  
+                    update_cosmos_system_message(active_sid, sys_msg)  
             session.modified = True  
             return redirect(url_for('index'))  
   
@@ -1550,6 +1580,15 @@ def index():
     max_total_history = 50  
     show_all_history = session.get("show_all_history", False)  
   
+    # ★ 現在アクティブなチャットの system_message を求める  
+    active_sid = session.get("current_session_id")  
+    current_system_message = session.get("default_system_message", "")  
+    if active_sid:  
+        for chat in sidebar_messages:  
+            if chat.get("session_id") == active_sid:  
+                current_system_message = chat.get("system_message", current_system_message)  
+                break  
+  
     return render_template(  
         'index.html',  
         chat_history=chat_history,  
@@ -1561,7 +1600,8 @@ def index():
         max_total_history=max_total_history,  
         session=session,  
         index_options=INDEX_OPTIONS,  
-        saved_prompts=saved_prompts  
+        saved_prompts=saved_prompts,  
+        current_system_message=current_system_message,  # ★ 追加  
     )  
   
   
