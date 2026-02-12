@@ -50,6 +50,7 @@ try:
 except ImportError:  
     tiktoken = None  
 
+
 # ------------------------------- アプリ環境/Flask -------------------------------  
 APP_ENV = os.getenv("APP_ENV", "prod").lower()  
 IS_LOCAL = APP_ENV == "local"  
