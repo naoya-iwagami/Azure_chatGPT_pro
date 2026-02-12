@@ -11,10 +11,8 @@
   <script>  
     window.MathJax = {  
       tex: {  
-        // インライン数式: $...$  
         inlineMath: [['$', '$']],  
-        // 別行数式: $$...$$ または $...$  
-        displayMath: [['$$', '$$'], ['\$', '\$']],  
+        displayMath: [['$$', '$$'], ['\\$', '\\$']],  
         processEscapes: true  
       },  
       svg: { fontCache: 'global' }  
@@ -24,96 +22,90 @@
           src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>  
   
   <style>  
-    #loadingInline { display: none; align-items: center;}  
-    #loadingInline .loading-text { font-size: 1rem; color: #333; margin-left: 0.5em;}  
-    #searchFilesDisplay {margin-bottom:1em;}  
-    #searchFilesDisplay ul {margin-bottom:0; padding-left:1.2em;}  
+    #loadingInline { display: none; align-items: center; }  
+    #loadingInline .loading-text { font-size: 1rem; color: #333; margin-left: 0.5em; }  
+    #searchFilesDisplay { margin-bottom: 1em; }  
+    #searchFilesDisplay ul { margin-bottom: 0; padding-left: 1.2em; }  
     .small-muted { font-size: 0.9em; color: #666; }  
     #searchFilesUlContainer {  
-        max-height: 50vh;  
-        overflow-y: auto;  
-        border: 1px solid #e0e0e0;  
-        background: #fff;  
-        margin-top: .5rem;  
-        padding: .5rem .75rem;  
+      max-height: 50vh;  
+      overflow-y: auto;  
+      border: 1px solid #e0e0e0;  
+      background: #fff;  
+      margin-top: .5rem;  
+      padding: .5rem .75rem;  
     }  
     #searchFilesUlContainer ul {  
-        margin: 0;  
-        padding-left: 1.2em;  
+      margin: 0;  
+      padding-left: 1.2em;  
     }  
   </style>  
 </head>  
+  
 <body>  
 <div class="container-fluid">  
   <div class="row">  
     <!-- サイドバー -->  
     <div class="col-md-3 sidebar">  
+  
       <h4>モデル設定</h4>  
-      <form method="POST" style="margin-bottom: 1em;">  
-        <div class="form-group">  
-          <label for="model_select">モデルを選択</label>  
-          <select id="model_select" name="model" class="form-control">  
-            <option value="gpt-4o" {% if session.get('selected_model') == 'gpt-4o' %}selected{% endif %}>gpt-4o</option>  
-            <option value="gpt-4.1" {% if session.get('selected_model') == 'gpt-4.1' %}selected{% endif %}>gpt-4.1</option>  
-            <option value="o3" {% if session.get('selected_model') == 'o3' %}selected{% endif %}>o3</option>  
-            <option value="o4-mini" {% if session.get('selected_model') == 'o4-mini' %}selected{% endif %}>o4-mini</option>  
-            <option value="gpt-5" {% if session.get('selected_model') == 'gpt-5' %}selected{% endif %}>gpt-5</option>  
-          </select>  
-          <input type="hidden" name="set_model" value="1">  
-        </div>  
-        <div class="form-group">  
-          <label for="reasoning_effort">reasoning_effort</label>  
-          <select id="reasoning_effort" name="reasoning_effort" class="form-control"  
-                  {% if session.get('selected_model') not in ['o3','o4-mini','gpt-5'] %}disabled{% endif %}>  
-            {% set eff = session.get('reasoning_effort', 'high') %}  
-            <option value="low" {% if eff == 'low' %}selected{% endif %}>low</option>  
-            <option value="medium" {% if eff == 'medium' %}selected{% endif %}>medium</option>  
-            <option value="high" {% if eff == 'high' %}selected{% endif %}>high</option>  
-          </select>  
-          <small class="form-text text-muted">  
-            o3 / o4-mini / gpt-5 選択時のみ有効です。  
-          </small>  
-        </div>  
-      </form>  
+      <div class="form-group">  
+        <label for="model_select">モデルを選択</label>  
+        <select id="model_select" name="model" class="form-control">  
+          <option value="gpt-4o" {% if session.get('selected_model') == 'gpt-4o' %}selected{% endif %}>gpt-4o</option>  
+          <option value="gpt-4.1" {% if session.get('selected_model') == 'gpt-4.1' %}selected{% endif %}>gpt-4.1</option>  
+          <option value="o3" {% if session.get('selected_model') == 'o3' %}selected{% endif %}>o3</option>  
+          <option value="o4-mini" {% if session.get('selected_model') == 'o4-mini' %}selected{% endif %}>o4-mini</option>  
+          <option value="gpt-5" {% if session.get('selected_model') == 'gpt-5' %}selected{% endif %}>gpt-5</option>  
+          <option value="gpt-5.1" {% if session.get('selected_model') == 'gpt-5.1' %}selected{% endif %}>gpt-5.1</option>  
+          <option value="gpt-5.2" {% if session.get('selected_model') == 'gpt-5.2' %}selected{% endif %}>gpt-5.2</option>  
+        </select>  
+      </div>  
+  
+      <div class="form-group">  
+        <label for="reasoning_effort">reasoning_effort</label>  
+        <select id="reasoning_effort" name="reasoning_effort" class="form-control"  
+                {% if session.get('selected_model') not in ['o3','o4-mini','gpt-5','gpt-5.1','gpt-5.2'] %}disabled{% endif %}>  
+          {% set eff = session.get('reasoning_effort', 'high') %}  
+          <option value="low" {% if eff == 'low' %}selected{% endif %}>low</option>  
+          <option value="medium" {% if eff == 'medium' %}selected{% endif %}>medium</option>  
+          <option value="high" {% if eff == 'high' %}selected{% endif %}>high</option>  
+        </select>  
+        <small class="form-text text-muted">  
+          o3 / o4-mini / gpt-5 / gpt-5.1 / gpt-5.2 選択時のみ有効です。  
+        </small>  
+      </div>  
   
       <h4>検索設定</h4>  
       <div class="small-muted">検索方法: ハイブリッド（キーワード＋セマンティック＋ベクターのRRF融合）</div>  
-      <form method="POST" style="margin-bottom: 1em; margin-top: .5em;">  
-        <div class="form-group">  
-          <label for="index_select">検索インデックス</label>  
-          <select id="index_select" name="search_index" class="form-control">  
-            {% set selected_idx = session.get('selected_search_index') %}  
-            {% for label, value in index_options %}  
-              <option value="{{ value }}" {% if selected_idx == value %}selected{% endif %}>  
-                {{ label }}  
-              </option>  
-            {% endfor %}  
-          </select>  
-          <input type="hidden" name="set_index" value="1">  
-        </div>  
-      </form>  
   
-      <form method="POST" style="margin-bottom: 1em;">  
-        <div class="form-group">  
-          <label for="doc_count">取得ドキュメント数（1～300）</label>  
-          <input type="number" id="doc_count" name="doc_count"  
-                 class="form-control" min="1" max="300" step="1"  
-                 value="{{ session.get('doc_count', 10) }}">  
-          <input type="hidden" name="set_doc_count" value="1">  
-          <small class="form-text text-muted">多くするほど文脈は増えますが、応答時間も長くなります。</small>  
-        </div>  
-      </form>  
+      <div class="form-group" style="margin-top: .5em;">  
+        <label for="index_select">検索インデックス</label>  
+        <select id="index_select" name="search_index" class="form-control">  
+          {% set selected_idx = session.get('selected_search_index') %}  
+          {% for label, value in index_options %}  
+            <option value="{{ value }}" {% if selected_idx == value %}selected{% endif %}>  
+              {{ label }}  
+            </option>  
+          {% endfor %}  
+        </select>  
+      </div>  
   
-      <form method="POST" style="margin-bottom: 1em;">  
-        <div class="form-group">  
-          <label for="history_to_send">過去メッセージ数（1～50）</label>  
-          <input type="number" id="history_to_send" name="history_to_send"  
-                 class="form-control" min="1" max="50" step="1"  
-                 value="{{ session.get('history_to_send', 10) }}">  
-          <input type="hidden" name="set_history_to_send" value="1">  
-          <small class="form-text text-muted">モデルに渡す直近の発話数を指定します。</small>  
-        </div>  
-      </form>  
+      <div class="form-group">  
+        <label for="doc_count">取得ドキュメント数（1～300）</label>  
+        <input type="number" id="doc_count" name="doc_count"  
+               class="form-control" min="1" max="300" step="1"  
+               value="{{ session.get('doc_count', 10) }}">  
+        <small class="form-text text-muted">多くするほど文脈は増えますが、応答時間も長くなります。</small>  
+      </div>  
+  
+      <div class="form-group">  
+        <label for="history_to_send">過去メッセージ数（1～50）</label>  
+        <input type="number" id="history_to_send" name="history_to_send"  
+               class="form-control" min="1" max="50" step="1"  
+               value="{{ session.get('history_to_send', 10) }}">  
+        <small class="form-text text-muted">モデルに渡す直近の発話数を指定します。</small>  
+      </div>  
   
       <!-- RAG ON/OFF スイッチ -->  
       <div class="form-group">  
@@ -127,17 +119,27 @@
         </small>  
       </div>  
   
-      <h5>モデルに指示を与える</h5>  
-      <!-- 現在のsystem_messageを直接編集 -->  
-      <form method="POST" style="margin-bottom: 1em;">  
-        <div class="form-group">  
-          <textarea class="form-control" name="system_message" rows="4"  
-          >{{ current_system_message }}</textarea>  
-          <input type="hidden" name="set_system_message" value="1">  
-        </div>  
-      </form>  
+      <hr>  
   
-      <!-- 登録済みの指示から選ぶ -->  
+      <h4>クエリリライト設定</h4>  
+      <div class="small-muted">リライト用 system prompt（検索クエリ生成AIへの指示）</div>  
+      <textarea id="rewriteSystemPrompt" class="form-control" rows="6">{{ session.get('rewrite_system_prompt','') }}</textarea>  
+  
+      <div class="small-muted mt-2">リライト用 user prompt テンプレ（組み立てルール）</div>  
+      <textarea id="rewriteUserPromptTemplate" class="form-control" rows="8">{{ session.get('rewrite_user_prompt_template','') }}</textarea>  
+      <small class="form-text text-muted">  
+        置換トークン: <code>{chat_system_message}</code>, <code>{chat_history}</code>, <code>{current_prompt}</code>  
+      </small>  
+  
+      <h5 class="mt-3">モデルに指示を与える</h5>  
+  
+      <!-- 現在のsystem_messageを直接編集（保存は blur の AJAX） -->  
+      <div class="form-group" style="margin-bottom: 1em;">  
+        <textarea class="form-control" name="system_message" rows="4">{{ current_system_message }}</textarea>  
+        <small class="form-text text-muted">編集後、フォーカスを外すと保存されます（AJAX）。</small>  
+      </div>  
+  
+      <!-- 登録済みの指示から選ぶ（これはフォーム送信が必要） -->  
       <form method="POST" style="margin-bottom: 1em;">  
         <div class="form-group">  
           <label for="select_prompt_id">登録済みの指示を選択</label>  
@@ -152,7 +154,7 @@
         </div>  
       </form>  
   
-      <!-- 新しい指示を登録 -->  
+      <!-- 新しい指示を登録（これはフォーム送信が必要） -->  
       <h6>指示を登録</h6>  
       <form method="POST" style="margin-bottom: 1em;">  
         <div class="form-group">  
@@ -190,6 +192,7 @@
           <p>チャット履歴がありません。</p>  
         {% endif %}  
       </ul>  
+  
       {% if chat_sessions|length > max_displayed_history %}  
         <form method="POST">  
           <button type="submit" name="toggle_history" class="btn btn-secondary">  
@@ -197,11 +200,13 @@
           </button>  
         </form>  
       {% endif %}  
+  
       <form method="POST">  
         <button type="submit" name="new_chat" value="true" class="btn btn-primary mt-2">新しいチャット</button>  
       </form>  
   
       <hr>  
+  
       <h4>ファイルアップロード（画像・PDF）</h4>  
       <form method="POST" enctype="multipart/form-data">  
         <div class="form-group">  
@@ -254,7 +259,7 @@
       {% with messages = get_flashed_messages() %}  
       {% if messages %}  
         <ul class="flashes">  
-        {% for m in messages %}<li>{{ m }}</li>{% endfor %}  
+          {% for m in messages %}<li>{{ m }}</li>{% endfor %}  
         </ul>  
       {% endif %}  
       {% endwith %}  
@@ -340,7 +345,6 @@ document.addEventListener('DOMContentLoaded', function() {
     }  
   }  
   
-  const chatForm = document.getElementById('chatForm');  
   const chatBox = document.getElementById('chatBox');  
   const sendButton = document.getElementById('sendButton');  
   const loadingInline = document.getElementById('loadingInline');  
@@ -420,6 +424,7 @@ document.addEventListener('DOMContentLoaded', function() {
       title.textContent = clarify  
         ? 'クエリリライト（検索に使用・要確認の可能性）'  
         : 'クエリリライト（検索に使用）';  
+  
       const list = document.createElement('ul');  
       list.className = 'rq-list';  
   
@@ -428,6 +433,7 @@ document.addEventListener('DOMContentLoaded', function() {
         li0.textContent = baseQuery + '（基準）';  
         list.appendChild(li0);  
       }  
+  
       queries.forEach(q => {  
         const li = document.createElement('li');  
         li.textContent = q;  
@@ -480,7 +486,7 @@ document.addEventListener('DOMContentLoaded', function() {
     currentSearchFiles = [];  
   }  
   
-  // RAG 検索結果表示  
+  // ★ RAG 検索結果表示（ファイル単位 + chunks表示対応）  
   function renderSearchFiles(files) {  
     if (!Array.isArray(files) || files.length === 0) {  
       clearSearchFilesDisplay();  
@@ -491,18 +497,39 @@ document.addEventListener('DOMContentLoaded', function() {
   
     let title = `<span id="searchFilesToggle" style="cursor:pointer; text-decoration:underline;">この質問で検索に利用された文書</span>`;  
     let ul = `<div id="searchFilesUlContainer" style="display:none;" tabindex="0"><ul>`;  
+  
     files.forEach((file, idx) => {  
+      const fTitle = (typeof file?.title === 'string' && file.title) ? file.title : '不明';  
+  
+      const folderText = (typeof file?.folder === 'string' && file.folder)  
+        ? ` <span class="small-muted">(${escapeHtml(file.folder)})</span>` : '';  
+  
+      // ★sources番号（ファイル内で使われたチャンクの [n] 集合）  
+      const srcNos = Array.isArray(file?.source_nos) ? file.source_nos : [];  
+      const srcLabel = srcNos.length ? ` <span class="small-muted">${srcNos.map(n => `[${n}]`).join('')}</span>` : '';  
+  
+      // ★チャンク数表示  
+      const chunks = Array.isArray(file?.chunks) ? file.chunks : [];  
+      const chunkNote = ` <span class="small-muted">[関連チャンク: ${chunks.length}件]</span>`;  
+  
+      // download link  
       let safeHref = '';  
-      if (typeof file?.url === 'string') {  
+      if (typeof file?.url === 'string' && file.url) {  
         safeHref = file.url.startsWith('/download_') ? file.url : encodeURI(file.url);  
       }  
       const dlBtn = (safeHref)  
         ? `<a href="${safeHref}" download style="margin-left:8px;" class="btn btn-link btn-sm" title="ダウンロード" target="_blank" rel="noopener"><span class="fa fa-download"></span>ダウンロード</a>`  
         : '';  
-      const folderText = (typeof file?.folder === 'string' && file.folder)  
-        ? ` <span class="small-muted">(${escapeHtml(file.folder)})</span>` : '';  
-      ul += `<li><span class="doc-num">${idx + 1}.</span> <a href="#" class="doclink" data-docidx="${idx}" style="text-decoration:underline; cursor:pointer">${escapeHtml(file.title)}</a>${folderText} ${dlBtn}</li>`;  
+  
+      ul += `<li>  
+        <span class="doc-num">${idx + 1}.</span>  
+        <a href="#" class="doclink" data-docidx="${idx}" style="text-decoration:underline; cursor:pointer">  
+          ${escapeHtml(fTitle)}  
+        </a>${srcLabel}${chunkNote}${folderText}  
+        ${dlBtn}  
+      </li>`;  
     });  
+  
     ul += `</ul></div>`;  
   
     searchFilesDisplay.innerHTML = title + ul;  
@@ -641,14 +668,21 @@ document.addEventListener('DOMContentLoaded', function() {
         isSending = false;  
         scrollChatToBottom();  
       });  
+  
+      // (削除) /send_message フォールバックは行わない  
       es.onerror = function(err) {  
         console.error('SSE connection error:', err);  
         if (finished) return;  
         es.close();  
         sendButton.disabled = false;  
         hideLoading();  
-        // SSE失敗時は JSON フォールバック  
-        fallbackJsonSubmit(prompt);  
+        isSending = false;  
+  
+        const warn = document.createElement('div');  
+        warn.className = 'alert alert-danger mt-2';  
+        warn.textContent = 'ストリーミング接続に失敗しました。ページを再読み込みして再試行してください。';  
+        assistantBubble.appendChild(warn);  
+        scrollChatToBottom();  
       };  
     })  
     .catch(err => {  
@@ -660,119 +694,93 @@ document.addEventListener('DOMContentLoaded', function() {
     });  
   }  
   
-  // 非ストリーミング JSON フォールバック  
-  function fallbackJsonSubmit(prompt) {  
-    sendButton.disabled = true;  
-    showLoading();  
-    clearSearchFilesDisplay();  
-  
-    fetch('/send_message', {  
-      method: 'POST',  
-      headers: {'Content-Type': 'application/json'},  
-      body: JSON.stringify({  
-        prompt: prompt,  
-        session_id: getCurrentSessionId()  
-      })  
-    })  
-    .then(r => r.json())  
-    .then(data => {  
-      if (Array.isArray(data.rewritten_queries)) {  
-        renderRewrittenQueriesUnder(lastUserBubbleEl, { queries: data.rewritten_queries });  
-      }  
-      let assistantEl = null;  
-      let bubbleEl = null;  
-      if (data.response) {  
-        const c = document.createElement('div');  
-        c.className = 'message-container assistant';  
-        c.innerHTML = `<div class="message-bubble">  
-            <strong>アシスタント:</strong>  
-            <div class="assistant-message">${data.response}</div>  
-          </div>`;  
-        chatBox.appendChild(c);  
-        assistantEl = c.querySelector('.assistant-message');  
-        bubbleEl = c.querySelector('.message-bubble');  
-  
-        // LaTeX を描画  
-        typesetMath(assistantEl);  
-  
-        const t = extractTitleFromHtml(data.response, 10);  
-        const sid = data.session_id || getCurrentSessionId();  
-        if (sid) {  
-          upsertSidebarItemById(sid, t);  
-          setCurrentSessionId(sid);  
-        }  
-      }  
-      if (Array.isArray(data.search_files) && data.search_files.length > 0) {  
-        renderSearchFiles(data.search_files);  
-      } else {  
-        clearSearchFilesDisplay();  
-      }  
-  
-      if (data.debug && bubbleEl) {  
-        console.log('DEBUG from /send_message:', data.debug);  
-        appendDebugBlock(bubbleEl, '送信内容デバッグ', data.debug);  
-      }  
-    })  
-    .catch(e => {  
-      console.error(e);  
-      alert('エラーが発生しました');  
-    })  
-    .finally(() => {  
-      sendButton.disabled = false;  
-      hideLoading();  
-      isSending = false;  
-      scrollChatToBottom();  
-    });  
-  }  
-  
   // フォーム送信ハンドラ  
   document.getElementById('chatForm').addEventListener('submit', e => {  
     e.preventDefault();  
     if (isSending) return;  
+  
     const prompt = promptTextarea.value.trim();  
     if (!prompt) return;  
+  
     isSending = true;  
-    const bubble = appendUserMessage(prompt);  
-    lastUserBubbleEl = bubble;  
+    lastUserBubbleEl = appendUserMessage(prompt);  
     promptTextarea.value = '';  
   
     if (window.EventSource) {  
       startSSE(prompt);  
     } else {  
-      fallbackJsonSubmit(prompt);  
+      isSending = false;  
+      alert('このブラウザは EventSource(SSE) をサポートしていません。');  
     }  
   });  
   
-  // RAG文書クリック時のモーダル表示  
+  // ★ RAG文書クリック時のモーダル表示（ファイル単位で chunks を一覧表示）  
+  function showModalDocument(doc) {  
+    const modalHtml = `  
+      <div class="modal fade" id="docModal" tabindex="-1">  
+        <div class="modal-dialog modal-lg"><div class="modal-content">  
+          <div class="modal-header">  
+            <h5 class="modal-title"></h5>  
+            <button type="button" class="close" data-dismiss="modal">&times;</button>  
+          </div>  
+          <div class="modal-body" style="white-space:pre-wrap; font-family:monospace; max-height:60vh; overflow:auto;"></div>  
+        </div></div>  
+      </div>`;  
+    const modalContainer = document.getElementById('docModalContainer');  
+    modalContainer.innerHTML = modalHtml;  
+  
+    const title = doc?.title || '不明';  
+    const filepath = doc?.filepath || '';  
+    const folder = doc?.folder || '';  
+    const sourceNos = Array.isArray(doc?.source_nos) ? doc.source_nos : [];  
+  
+    const chunks = Array.isArray(doc?.chunks) ? doc.chunks : [];  
+    const legacyContent = (typeof doc?.content === 'string') ? doc.content : '';  
+  
+    const lines = [];  
+    lines.push(`タイトル: ${title}`);  
+    if (sourceNos.length) lines.push(`Sources番号: ${sourceNos.map(n => `[${n}]`).join('')}`);  
+    if (folder) lines.push(`フォルダ: ${folder}`);  
+    if (filepath) lines.push(`filepath: ${filepath}`);  
+    lines.push('');  
+  
+    if (chunks.length > 0) {  
+      lines.push(`--- 関連チャンク: ${chunks.length}件 ---`);  
+      lines.push('');  
+      chunks.forEach((c, i) => {  
+        const cid = c?.chunk_id || '';  
+        const srcNo = c?.source_no || '';  
+        lines.push(`[${i+1}] Sources番号: [${srcNo}]  chunk_id: ${cid}`);  
+        lines.push((c?.content || '').trim());  
+        lines.push('');  
+        lines.push('----------------------------------------');  
+        lines.push('');  
+      });  
+    } else {  
+      // 旧形式フォールバック  
+      lines.push('--- 内容 ---');  
+      lines.push('');  
+      lines.push((legacyContent || '').trim());  
+    }  
+  
+    $('#docModal .modal-title').text(title);  
+    $('#docModal .modal-body').text(lines.join('\n'));  
+    $('#docModal').modal('show');  
+  }  
+  
   searchFilesDisplay.addEventListener('click', function(e) {  
     if (e.target && e.target.classList.contains('doclink')) {  
       e.preventDefault();  
-      const idx = e.target.getAttribute('data-docidx');  
+      const idx = parseInt(e.target.getAttribute('data-docidx'), 10);  
       const doc = currentSearchFiles && currentSearchFiles[idx];  
-      if (doc) {  
-        let modalHtml = `  
-          <div class="modal fade" id="docModal" tabindex="-1">  
-            <div class="modal-dialog modal-lg"><div class="modal-content">  
-            <div class="modal-header">  
-              <h5 class="modal-title"></h5>  
-              <button type="button" class="close" data-dismiss="modal">&times;</button>  
-            </div>  
-            <div class="modal-body" style="white-space:pre-wrap; font-family:monospace; max-height:60vh; overflow:auto;"></div>  
-            </div></div>  
-          </div>`;  
-        let modalContainer = document.getElementById('docModalContainer');  
-        modalContainer.innerHTML = modalHtml;  
-        $('#docModal .modal-title').text(doc.title);  
-        $('#docModal .modal-body').text(doc.content);  
-        $('#docModal').modal('show');  
-      }  
+      if (doc) showModalDocument(doc);  
     }  
   });  
   
   // Enter で送信（Shift+Enter は改行）  
   const promptTextareaEl = document.getElementById('promptTextarea');  
   promptTextareaEl.addEventListener('keydown', e => {  
-    if (e.key==='Enter' && !e.shiftKey) {  
+    if (e.key === 'Enter' && !e.shiftKey) {  
       e.preventDefault();  
       document.getElementById('chatForm').dispatchEvent(new Event('submit'));  
     }  
@@ -800,7 +808,7 @@ document.addEventListener('DOMContentLoaded', function() {
   const modelSelect = document.getElementById('model_select');  
   const reasoningEffortSelect = document.getElementById('reasoning_effort');  
   function updateReasoningSelectState(model) {  
-    const enabledModels = ['o3','o4-mini','gpt-5'];  
+    const enabledModels = ['o3','o4-mini','gpt-5','gpt-5.1','gpt-5.2'];  
     if (reasoningEffortSelect) {  
       reasoningEffortSelect.disabled = !enabledModels.includes(model);  
     }  
@@ -849,6 +857,20 @@ document.addEventListener('DOMContentLoaded', function() {
   if (sysMsgTextarea) {  
     sysMsgTextarea.addEventListener('blur', function() {  
       postSettings({ default_system_message: this.value });  
+    });  
+  }  
+  
+  // ★ クエリリライト用プロンプト（blurで保存）  
+  const rewriteSys = document.getElementById('rewriteSystemPrompt');  
+  if (rewriteSys) {  
+    rewriteSys.addEventListener('blur', function() {  
+      postSettings({ rewrite_system_prompt: this.value });  
+    });  
+  }  
+  const rewriteUserTmpl = document.getElementById('rewriteUserPromptTemplate');  
+  if (rewriteUserTmpl) {  
+    rewriteUserTmpl.addEventListener('blur', function() {  
+      postSettings({ rewrite_user_prompt_template: this.value });  
     });  
   }  
   
