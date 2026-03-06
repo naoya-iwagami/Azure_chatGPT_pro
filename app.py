@@ -329,7 +329,7 @@ def estimate_input_tokens(model_name: str, input_items: list):
   
     - text 系コンテンツ (input_text / output_text / text) だけを対象  
     - 画像 (input_image) や PDF (input_file) はトークン数に含めない  
-       → その分、モデルの usage.input_tokens より少なめに出る  
+        → その分、モデルの usage.input_tokens より少なめに出る  
     """  
     if not input_items:  
         return 0  
@@ -942,7 +942,7 @@ def get_authenticated_user():
             user_data = json.loads(decoded)  
             user_id = user_name = None  
             for claim in user_data.get("claims", []):  
-                if claim.get("typ") == "http://schemas.microsoft.com/identity/claims/objectidentifier":  
+                if claim.get("typ") == "[http://schemas.microsoft.com/identity/claims/objectidentifier](http://schemas.microsoft.com/identity/claims/objectidentifier)":  
                     user_id = claim.get("val")  
                 if claim.get("typ") == "name":  
                     user_name = claim.get("val")  
@@ -2143,13 +2143,16 @@ def stream_message():
   
             with client.responses.stream(**request_kwargs) as stream:  
                 for event in stream:  
-                    etype = getattr(event, "type", "")  
+                    # ★【修正箇所】type が None で返ってきた場合でも安全に空文字("")になるようにガード  
+                    etype = getattr(event, "type", "") or ""  
+  
                     if etype == "response.output_text.delta":  
                         delta = getattr(event, "delta", "") or ""  
                         if isinstance(delta, str) and delta:  
                             result_holder["full_text"] += delta  
                             q.put(_sse_event("delta", {"text": delta}))  
-                    elif etype.endswith(".delta"):  
+                    # ★【修正箇所】etype が空文字ではないことを明確にチェックしてから endswith を使う  
+                    elif etype and etype.endswith(".delta"):  
                         delta = getattr(event, "delta", "") or ""  
                         if isinstance(delta, str) and delta:  
                             result_holder["full_text"] += delta  
@@ -2408,4 +2411,4 @@ def view_blob(container, blobname):
   
 # ------------------------------- エントリポイント -------------------------------  
 if __name__ == "__main__":  
-    app.run(debug=True, host="0.0.0.0")  
+    app.run(debug=True, host="0.0.0.0")
