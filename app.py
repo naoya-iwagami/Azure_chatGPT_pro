@@ -49,7 +49,7 @@ try:
     import tiktoken  
 except ImportError:  
     tiktoken = None  
-  
+
 # ------------------------------- アプリ環境/Flask -------------------------------  
 APP_ENV = os.getenv("APP_ENV", "prod").lower()  
 IS_LOCAL = APP_ENV == "local"  
@@ -258,7 +258,6 @@ def normalize_blobname(s: str) -> str:
     except Exception:  
         return s  
   
-  
 # ------------------------------- ユーティリティ -------------------------------  
 def build_download_url(container_name: str, blobname: str, is_text: bool) -> str:  
     """  
@@ -281,7 +280,6 @@ def make_blob_url(container_name: str, blobname: str) -> str:
     except Exception:  
         return ""  
   
-  
 # (A) 統合: Blob -> base64  
 def encode_blob_to_base64(blob_client) -> str:  
     downloader = blob_client.download_blob()  
@@ -296,7 +294,6 @@ def strip_html_tags(html: str) -> str:
     html = re.sub(r"</p\s*>", "\n", html, flags=re.I)  
     text = re.sub(r"<[^>]+>", "", html)  
     return text  
-  
   
 # ------------------------------- トークナイズ関連 -------------------------------  
 def _get_encoding_for_model(model_name: str):  
@@ -329,7 +326,7 @@ def estimate_input_tokens(model_name: str, input_items: list):
   
     - text 系コンテンツ (input_text / output_text / text) だけを対象  
     - 画像 (input_image) や PDF (input_file) はトークン数に含めない  
-        → その分、モデルの usage.input_tokens より少なめに出る  
+       → その分、モデルの usage.input_tokens より少なめに出る  
     """  
     if not input_items:  
         return 0  
@@ -387,7 +384,6 @@ def extract_usage_input_tokens(resp_obj, resp_payload):
         pass  
   
     return None  
-  
   
 # ------------------------------- その他ユーティリティ -------------------------------  
 def compute_first_assistant_title(messages, limit=30) -> str:  
@@ -540,7 +536,6 @@ def resolve_container_blob_from_result(selected_index: str, result):
         return resolve_blob_from_filepath(selected_index, fp)  
     return (None, None)  
   
-  
 # 追加: フォルダ名抽出（タイトルの右側に表示するため）  
 def extract_folder_from_blobname(blobname: str) -> str:  
     if not blobname:  
@@ -574,7 +569,6 @@ def extract_folder_from_result(selected_index: str, result) -> str:
         pass  
     return ""  
   
-  
 # -------------------------------  
 # ★追加: 「チャンク単位重複排除キー」を安全に作る  
 # -------------------------------  
@@ -592,7 +586,6 @@ def make_chunk_dedup_key(r: dict) -> str:
     if chunk_id and path_key:  
         return f"{path_key}#{chunk_id}"  
     return chunk_id or path_key  
-  
   
 # -------------------------------  
 # ★追加: 「ファイル単位のキー」を作る（UIでファイルグループ化用）  
@@ -616,7 +609,6 @@ def make_file_key_and_location(selected_index: str, r: dict):
   
     title = (r.get("title") or "").strip()  
     return title, None, None  
-  
   
 # -------------------------------  
 # ★追加: 検索結果（チャンク配列）を「ファイルごと」にグループ化して UI 用 search_files を作る  
@@ -725,7 +717,6 @@ def build_search_files_grouped_by_file(selected_index: str, results_list: list) 
         )  
     return out  
   
-  
 # -------------------------------  
 # ★追加: インデックスごとの Search 設定（フィールド差吸収）  
 # -------------------------------  
@@ -833,7 +824,6 @@ def normalize_search_result(index_name: str, r: dict) -> dict:
     out["@search.captions"] = r.get("@search.captions")  
     return out  
   
-  
 # ------------------------------- クエリリライト（ユーザー編集対応） -------------------------------  
 DEFAULT_REWRITE_SYSTEM_PROMPT = (  
     "あなたは社内文書検索クエリ生成AIです。\n"  
@@ -930,7 +920,6 @@ def rewrite_queries_for_search_responses(
         qs = [current_prompt.strip()[:30] or "検索"]  
     return qs  
   
-  
 # ------------------------------- 認証/履歴等 -------------------------------  
 def get_authenticated_user():  
     if "user_id" in session and "user_name" in session:  
@@ -942,7 +931,7 @@ def get_authenticated_user():
             user_data = json.loads(decoded)  
             user_id = user_name = None  
             for claim in user_data.get("claims", []):  
-                if claim.get("typ") == "[http://schemas.microsoft.com/identity/claims/objectidentifier](http://schemas.microsoft.com/identity/claims/objectidentifier)":  
+                if claim.get("typ") == "http://schemas.microsoft.com/identity/claims/objectidentifier":  
                     user_id = claim.get("val")  
                 if claim.get("typ") == "name":  
                     user_name = claim.get("val")  
@@ -1131,7 +1120,6 @@ def load_chat_history():
             traceback.print_exc()  
         return sidebar_messages  
   
-  
 # ★★★★★ ここから systemprompts_1 用のコード ★★★★★  
 def save_system_prompt_item(title: str, content: str):  
     if not system_prompt_container:  
@@ -1190,7 +1178,6 @@ def load_system_prompts():
             traceback.print_exc()  
         return prompts  
   
-  
 # ★★★★★ systemprompts_1 関連ここまで ★★★★★  
   
   
@@ -1217,7 +1204,6 @@ def start_new_chat():
     session["current_session_id"] = new_session_id  
     session["main_chat_messages"] = []  
     session.modified = True  
-  
   
 # ------------------------------- Azure Cognitive Search -------------------------------  
 def get_search_client(index_name):  
@@ -1323,7 +1309,6 @@ def keyword_vector_search(query, topNDocuments, index_name):
         print("ベクター検索エラー:", e)  
         traceback.print_exc()  
         return []  
-  
   
 # (B) 共通化: RRF融合（dedup + 加点 + fusion_score付与）  
 def _rrf_fuse_ranked_lists_common(  
@@ -1440,7 +1425,6 @@ def rrf_fuse_ranked_lists(lists_of_results, topNDocuments):
         parent_id_fn=lambda r: r.get("parent_id"),  
     )  
   
-  
 # ------------------------------- HyDE / PRF -------------------------------  
 def hyde_paragraph(user_input: str) -> str:  
     sys_msg = "あなたは検索のための仮想文書(HyDE)を作成します。事実の付け足しは避け、中立で。"  
@@ -1481,7 +1465,6 @@ def refine_query_with_prf(initial_query: str, titles: list) -> str:
   
 def unique_parents(results):  
     return len({(r.get("parent_id") or r.get("filepath") or r.get("title")) for r in (results or [])})  
-  
   
 # ------------------------------- Responses 入力構築 -------------------------------  
 def build_responses_input_with_history(  
@@ -1541,7 +1524,6 @@ def build_responses_input_with_history(
   
     return input_items, last_user_index  
   
-  
 # ------------------------------- セッション内ファイル一括削除 -------------------------------  
 def _delete_uploaded_files_for_session():  
     deleted = {"images": [], "files": []}  
@@ -1575,7 +1557,6 @@ def _delete_uploaded_files_for_session():
 def cleanup_session_files():  
     result = _delete_uploaded_files_for_session()  
     return jsonify({"ok": True, "deleted": result})  
-  
   
 # ------------------------------- 設定更新（AJAX） -------------------------------  
 @app.route("/update_settings", methods=["POST"])  
@@ -1649,7 +1630,6 @@ def update_settings():
   
     session.modified = True  
     return jsonify({"ok": True, "changed": changed})  
-  
   
 # ------------------------------- ルーティング -------------------------------  
 @app.route("/", methods=["GET", "POST"])  
@@ -1876,7 +1856,6 @@ def index():
         saved_prompts=saved_prompts,  
         current_system_message=current_system_message,  
     )  
-  
   
 # ------------------------------- 準備/SSE -------------------------------  
 @app.route("/prepare_stream", methods=["POST"])  
@@ -2143,16 +2122,14 @@ def stream_message():
   
             with client.responses.stream(**request_kwargs) as stream:  
                 for event in stream:  
-                    # ★【修正箇所】type が None で返ってきた場合でも安全に空文字("")になるようにガード  
-                    etype = getattr(event, "type", "") or ""  
-  
+                    etype = getattr(event, "type", "")  
                     if etype == "response.output_text.delta":  
                         delta = getattr(event, "delta", "") or ""  
                         if isinstance(delta, str) and delta:  
                             result_holder["full_text"] += delta  
                             q.put(_sse_event("delta", {"text": delta}))  
-                    # ★【修正箇所】etype が空文字ではないことを明確にチェックしてから endswith を使う  
-                    elif etype and etype.endswith(".delta"):  
+                    elif isinstance(etype, str) and etype.endswith(".delta"):  
+                        # ↑ ここを修正：etype が None の場合を避ける  
                         delta = getattr(event, "delta", "") or ""  
                         if isinstance(delta, str) and delta:  
                             result_holder["full_text"] += delta  
@@ -2305,7 +2282,6 @@ def stream_message():
     }  
     return app.response_class(stream_with_context(generate()), headers=headers)  
   
-  
 # ------------------------------- テキスト Blob ダウンロード（attachment） -------------------------------  
 @app.route("/download_txt/<container>/<path:blobname>")  
 def download_txt(container, blobname):  
@@ -2348,7 +2324,6 @@ def download_txt(container, blobname):
         traceback.print_exc()  
         return (f"Unexpected error: {e}", 500)  
   
-  
 # ------------------------------- バイナリ Blob ダウンロード（attachment） -------------------------------  
 @app.route("/download_blob/<container>/<path:blobname>")  
 def download_blob(container, blobname):  
@@ -2375,7 +2350,6 @@ def download_blob(container, blobname):
         print("Unexpected blob download error:", e)  
         traceback.print_exc()  
         return (f"Unexpected error: {e}", 500)  
-  
   
 # ------------------------------- Blob inline 表示（画像/PDF等） -------------------------------  
 @app.route("/view_blob/<container>/<path:blobname>")  
@@ -2408,7 +2382,6 @@ def view_blob(container, blobname):
         traceback.print_exc()  
         return (f"Unexpected error: {e}", 500)  
   
-  
 # ------------------------------- エントリポイント -------------------------------  
 if __name__ == "__main__":  
-    app.run(debug=True, host="0.0.0.0")
+    app.run(debug=True, host="0.0.0.0")  
