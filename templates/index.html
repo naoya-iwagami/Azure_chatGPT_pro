@@ -139,14 +139,16 @@
         <small class="form-text text-muted">編集後、フォーカスを外すと保存されます（AJAX）。</small>  
       </div>  
   
-      <!-- 登録済みの指示から選ぶ（これはフォーム送信が必要） -->  
+      <!-- 登録済みの指示から選ぶ -->  
       <form method="POST" style="margin-bottom: 1em;">  
         <div class="form-group">  
           <label for="select_prompt_id">登録済みの指示を選択</label>  
           <select id="select_prompt_id" name="select_prompt_id" class="form-control" onchange="this.form.submit()">  
             <option value="">-- 選択してください --</option>  
             {% for p in saved_prompts %}  
-              <option value="{{ p.id }}">{{ p.title }}</option>  
+              <option value="{{ p.id }}">  
+                {{ p.title }}{% if p.user_name %}（{{ p.user_name }}）{% endif %}  
+              </option>  
             {% endfor %}  
           </select>  
           <input type="hidden" name="apply_system_prompt" value="1">  
@@ -154,7 +156,7 @@
         </div>  
       </form>  
   
-      <!-- 新しい指示を登録（これはフォーム送信が必要） -->  
+      <!-- 新しい指示を登録 -->  
       <h6>指示を登録</h6>  
       <form method="POST" style="margin-bottom: 1em;">  
         <div class="form-group">  
@@ -168,6 +170,38 @@
         <button type="submit" class="btn btn-outline-primary">登録</button>  
         <input type="hidden" name="add_system_prompt" value="1">  
       </form>  
+  
+      <!-- 共有システムプロンプト一覧 -->  
+      <h6 class="mt-2">登録済みの指示一覧</h6>  
+      <div class="list-group mb-3">  
+        {% for p in saved_prompts %}  
+          <div class="list-group-item py-2">  
+            <div class="d-flex justify-content-between align-items-start">  
+              <div style="min-width:0;">  
+                <div>  
+                  <strong>{{ p.title }}</strong>  
+                  {% if p.user_name %}  
+                    <span class="small-muted">（{{ p.user_name }}）</span>  
+                  {% endif %}  
+                </div>  
+                <div class="small-muted" style="white-space: pre-wrap;">  
+                  {{ p.content[:120] }}{% if p.content|length > 120 %}…{% endif %}  
+                </div>  
+              </div>  
+  
+              {% if p.user_id == session.get('user_id') %}  
+                <form method="POST" class="ml-2"  
+                      onsubmit="return confirm('このシステムプロンプトを削除しますか？');">  
+                  <input type="hidden" name="delete_system_prompt" value="{{ p.id }}">  
+                  <button type="submit" class="btn btn-outline-danger btn-sm">削除</button>  
+                </form>  
+              {% endif %}  
+            </div>  
+          </div>  
+        {% else %}  
+          <div class="small-muted">登録済みの指示はありません。</div>  
+        {% endfor %}  
+      </div>  
   
       <h4>チャット履歴</h4>  
       <ul class="chat-history" id="chatHistoryList">  

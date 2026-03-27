@@ -258,6 +258,7 @@ def normalize_blobname(s: str) -> str:
     except Exception:  
         return s  
   
+  
 # ------------------------------- ユーティリティ -------------------------------  
 def build_download_url(container_name: str, blobname: str, is_text: bool) -> str:  
     """  
@@ -280,6 +281,7 @@ def make_blob_url(container_name: str, blobname: str) -> str:
     except Exception:  
         return ""  
   
+  
 # (A) 統合: Blob -> base64  
 def encode_blob_to_base64(blob_client) -> str:  
     downloader = blob_client.download_blob()  
@@ -294,6 +296,7 @@ def strip_html_tags(html: str) -> str:
     html = re.sub(r"</p\s*>", "\n", html, flags=re.I)  
     text = re.sub(r"<[^>]+>", "", html)  
     return text  
+  
   
 # ------------------------------- トークナイズ関連 -------------------------------  
 def _get_encoding_for_model(model_name: str):  
@@ -326,7 +329,7 @@ def estimate_input_tokens(model_name: str, input_items: list):
   
     - text 系コンテンツ (input_text / output_text / text) だけを対象  
     - 画像 (input_image) や PDF (input_file) はトークン数に含めない  
-       → その分、モデルの usage.input_tokens より少なめに出る  
+      → その分、モデルの usage.input_tokens より少なめに出る  
     """  
     if not input_items:  
         return 0  
@@ -384,6 +387,7 @@ def extract_usage_input_tokens(resp_obj, resp_payload):
         pass  
   
     return None  
+  
   
 # ------------------------------- その他ユーティリティ -------------------------------  
 def compute_first_assistant_title(messages, limit=30) -> str:  
@@ -536,6 +540,7 @@ def resolve_container_blob_from_result(selected_index: str, result):
         return resolve_blob_from_filepath(selected_index, fp)  
     return (None, None)  
   
+  
 # 追加: フォルダ名抽出（タイトルの右側に表示するため）  
 def extract_folder_from_blobname(blobname: str) -> str:  
     if not blobname:  
@@ -569,6 +574,7 @@ def extract_folder_from_result(selected_index: str, result) -> str:
         pass  
     return ""  
   
+  
 # -------------------------------  
 # ★追加: 「チャンク単位重複排除キー」を安全に作る  
 # -------------------------------  
@@ -587,12 +593,14 @@ def make_chunk_dedup_key(r: dict) -> str:
         return f"{path_key}#{chunk_id}"  
     return chunk_id or path_key  
   
+  
 # -------------------------------  
 # ★追加: 「ファイル単位のキー」を作る（UIでファイルグループ化用）  
 # -------------------------------  
 def make_file_key_and_location(selected_index: str, r: dict):  
     """  
     return: (file_key, container_name, blobname)  
+  
       - file_key: できれば "container/blobname" の形式（同一ファイル判定が安定）  
     """  
     container_name2, blobname = resolve_container_blob_from_result(selected_index, r)  
@@ -609,6 +617,7 @@ def make_file_key_and_location(selected_index: str, r: dict):
   
     title = (r.get("title") or "").strip()  
     return title, None, None  
+  
   
 # -------------------------------  
 # ★追加: 検索結果（チャンク配列）を「ファイルごと」にグループ化して UI 用 search_files を作る  
@@ -717,6 +726,7 @@ def build_search_files_grouped_by_file(selected_index: str, results_list: list) 
         )  
     return out  
   
+  
 # -------------------------------  
 # ★追加: インデックスごとの Search 設定（フィールド差吸収）  
 # -------------------------------  
@@ -824,6 +834,7 @@ def normalize_search_result(index_name: str, r: dict) -> dict:
     out["@search.captions"] = r.get("@search.captions")  
     return out  
   
+  
 # ------------------------------- クエリリライト（ユーザー編集対応） -------------------------------  
 DEFAULT_REWRITE_SYSTEM_PROMPT = (  
     "あなたは社内文書検索クエリ生成AIです。\n"  
@@ -919,6 +930,7 @@ def rewrite_queries_for_search_responses(
     if not qs:  
         qs = [current_prompt.strip()[:30] or "検索"]  
     return qs  
+  
   
 # ------------------------------- 認証/履歴等 -------------------------------  
 def get_authenticated_user():  
@@ -1120,6 +1132,7 @@ def load_chat_history():
             traceback.print_exc()  
         return sidebar_messages  
   
+  
 # ★★★★★ ここから systemprompts_1 用のコード ★★★★★  
 def save_system_prompt_item(title: str, content: str):  
     if not system_prompt_container:  
@@ -1146,22 +1159,22 @@ def save_system_prompt_item(title: str, content: str):
   
   
 def load_system_prompts():  
+    """  
+    ★ 全ユーザー共通でシステムプロンプトを読み込む  
+    """  
     if not system_prompt_container:  
         return []  
     with lock:  
-        get_authenticated_user()  
         prompts = []  
         try:  
             query = """  
-            SELECT c.id, c.title, c.content, c.timestamp  
+            SELECT c.id, c.title, c.content, c.timestamp, c.user_id, c.user_name  
             FROM c  
-            WHERE c.user_id = @user_id AND c.doc_type = 'system_prompt'  
+            WHERE c.doc_type = 'system_prompt'  
             ORDER BY c.timestamp DESC  
             """  
-            parameters = [{"name": "@user_id", "value": session["user_id"]}]  
             items = system_prompt_container.query_items(  
                 query=query,  
-                parameters=parameters,  
                 enable_cross_partition_query=True,  
             )  
             for it in items:  
@@ -1171,12 +1184,64 @@ def load_system_prompts():
                         "title": it.get("title"),  
                         "content": it.get("content"),  
                         "timestamp": it.get("timestamp"),  
+                        "user_id": it.get("user_id"),  
+                        "user_name": it.get("user_name", ""),  
                     }  
                 )  
         except Exception as e:  
             print("システムプロンプト読込エラー:", e)  
             traceback.print_exc()  
         return prompts  
+  
+  
+def delete_system_prompt_item(prompt_id: str):  
+    """  
+    ★ 削除は作成者本人だけ許可  
+    ※ systemprompts_1 の partition key が /user_id 前提  
+    """  
+    if not system_prompt_container or not prompt_id:  
+        return False, "削除対象が不正です。"  
+  
+    with lock:  
+        try:  
+            current_user_id = get_authenticated_user()  
+  
+            query = """  
+            SELECT TOP 1 c.id, c.user_id, c.title  
+            FROM c  
+            WHERE c.id = @id AND c.doc_type = 'system_prompt'  
+            """  
+            parameters = [{"name": "@id", "value": prompt_id}]  
+            items = list(  
+                system_prompt_container.query_items(  
+                    query=query,  
+                    parameters=parameters,  
+                    enable_cross_partition_query=True,  
+                )  
+            )  
+  
+            if not items:  
+                return False, "対象のシステムプロンプトが見つかりません。"  
+  
+            item = items[0]  
+            owner_user_id = item.get("user_id")  
+  
+            if owner_user_id != current_user_id:  
+                return False, "このシステムプロンプトを削除できるのは登録者本人のみです。"  
+  
+            system_prompt_container.delete_item(  
+                item=prompt_id,  
+                partition_key=owner_user_id,  
+            )  
+            return True, "システムプロンプトを削除しました。"  
+  
+        except ResourceNotFoundError:  
+            return False, "対象のシステムプロンプトが見つかりません。"  
+        except Exception as e:  
+            print("システムプロンプト削除エラー:", e)  
+            traceback.print_exc()  
+            return False, f"削除に失敗しました: {e}"  
+  
   
 # ★★★★★ systemprompts_1 関連ここまで ★★★★★  
   
@@ -1204,6 +1269,7 @@ def start_new_chat():
     session["current_session_id"] = new_session_id  
     session["main_chat_messages"] = []  
     session.modified = True  
+  
   
 # ------------------------------- Azure Cognitive Search -------------------------------  
 def get_search_client(index_name):  
@@ -1309,6 +1375,7 @@ def keyword_vector_search(query, topNDocuments, index_name):
         print("ベクター検索エラー:", e)  
         traceback.print_exc()  
         return []  
+  
   
 # (B) 共通化: RRF融合（dedup + 加点 + fusion_score付与）  
 def _rrf_fuse_ranked_lists_common(  
@@ -1425,6 +1492,7 @@ def rrf_fuse_ranked_lists(lists_of_results, topNDocuments):
         parent_id_fn=lambda r: r.get("parent_id"),  
     )  
   
+  
 # ------------------------------- HyDE / PRF -------------------------------  
 def hyde_paragraph(user_input: str) -> str:  
     sys_msg = "あなたは検索のための仮想文書(HyDE)を作成します。事実の付け足しは避け、中立で。"  
@@ -1465,6 +1533,7 @@ def refine_query_with_prf(initial_query: str, titles: list) -> str:
   
 def unique_parents(results):  
     return len({(r.get("parent_id") or r.get("filepath") or r.get("title")) for r in (results or [])})  
+  
   
 # ------------------------------- Responses 入力構築 -------------------------------  
 def build_responses_input_with_history(  
@@ -1524,6 +1593,7 @@ def build_responses_input_with_history(
   
     return input_items, last_user_index  
   
+  
 # ------------------------------- セッション内ファイル一括削除 -------------------------------  
 def _delete_uploaded_files_for_session():  
     deleted = {"images": [], "files": []}  
@@ -1557,6 +1627,7 @@ def _delete_uploaded_files_for_session():
 def cleanup_session_files():  
     result = _delete_uploaded_files_for_session()  
     return jsonify({"ok": True, "deleted": result})  
+  
   
 # ------------------------------- 設定更新（AJAX） -------------------------------  
 @app.route("/update_settings", methods=["POST"])  
@@ -1631,6 +1702,7 @@ def update_settings():
     session.modified = True  
     return jsonify({"ok": True, "changed": changed})  
   
+  
 # ------------------------------- ルーティング -------------------------------  
 @app.route("/", methods=["GET", "POST"])  
 def index():  
@@ -1668,8 +1740,8 @@ def index():
         session["image_filenames"] = []  
     if "file_filenames" not in session:  
         session["file_filenames"] = []  
-    if "saved_prompts" not in session:  
-        session["saved_prompts"] = load_system_prompts()  
+    # ★ 共有プロンプトは毎回最新を読む  
+    session["saved_prompts"] = load_system_prompts()  
     if "show_all_history" not in session:  
         session["show_all_history"] = False  
     if "upload_prefix" not in session:  
@@ -1704,7 +1776,8 @@ def index():
   
         if "apply_system_prompt" in request.form:  
             prompt_id = request.form.get("select_prompt_id")  
-            saved = session.get("saved_prompts", [])  
+            saved = load_system_prompts()  
+            session["saved_prompts"] = saved  
             match = next((p for p in saved if p.get("id") == prompt_id), None)  
             if match:  
                 sys_msg = match.get("content", "")  
@@ -1728,6 +1801,14 @@ def index():
                 pid = save_system_prompt_item(title, content)  
                 if pid:  
                     session["saved_prompts"] = load_system_prompts()  
+            session.modified = True  
+            return redirect(url_for("index"))  
+  
+        if "delete_system_prompt" in request.form:  
+            prompt_id = (request.form.get("delete_system_prompt") or "").strip()  
+            ok, msg = delete_system_prompt_item(prompt_id)  
+            flash(msg, "success" if ok else "error")  
+            session["saved_prompts"] = load_system_prompts()  
             session.modified = True  
             return redirect(url_for("index"))  
   
@@ -1856,6 +1937,7 @@ def index():
         saved_prompts=saved_prompts,  
         current_system_message=current_system_message,  
     )  
+  
   
 # ------------------------------- 準備/SSE -------------------------------  
 @app.route("/prepare_stream", methods=["POST"])  
@@ -2282,6 +2364,7 @@ def stream_message():
     }  
     return app.response_class(stream_with_context(generate()), headers=headers)  
   
+  
 # ------------------------------- テキスト Blob ダウンロード（attachment） -------------------------------  
 @app.route("/download_txt/<container>/<path:blobname>")  
 def download_txt(container, blobname):  
@@ -2324,6 +2407,7 @@ def download_txt(container, blobname):
         traceback.print_exc()  
         return (f"Unexpected error: {e}", 500)  
   
+  
 # ------------------------------- バイナリ Blob ダウンロード（attachment） -------------------------------  
 @app.route("/download_blob/<container>/<path:blobname>")  
 def download_blob(container, blobname):  
@@ -2350,6 +2434,7 @@ def download_blob(container, blobname):
         print("Unexpected blob download error:", e)  
         traceback.print_exc()  
         return (f"Unexpected error: {e}", 500)  
+  
   
 # ------------------------------- Blob inline 表示（画像/PDF等） -------------------------------  
 @app.route("/view_blob/<container>/<path:blobname>")  
@@ -2381,6 +2466,7 @@ def view_blob(container, blobname):
         print("Unexpected blob view error:", e)  
         traceback.print_exc()  
         return (f"Unexpected error: {e}", 500)  
+  
   
 # ------------------------------- エントリポイント -------------------------------  
 if __name__ == "__main__":  
