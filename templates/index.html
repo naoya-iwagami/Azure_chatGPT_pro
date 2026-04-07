@@ -7,7 +7,6 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">  
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.css">  
   
-  <!-- MathJax 設定 & 読み込み（LaTeX用） -->  
   <script>  
     window.MathJax = {  
       tex: {  
@@ -45,7 +44,6 @@
 <body>  
 <div class="container-fluid">  
   <div class="row">  
-    <!-- サイドバー -->  
     <div class="col-md-3 sidebar">  
   
       <h4>モデル設定</h4>  
@@ -107,7 +105,6 @@
         <small class="form-text text-muted">モデルに渡す直近の発話数を指定します。</small>  
       </div>  
   
-      <!-- RAG ON/OFF スイッチ -->  
       <div class="form-group">  
         <div class="custom-control custom-switch">  
           <input type="checkbox" class="custom-control-input" id="ragEnabled"  
@@ -118,6 +115,16 @@
           OFFにすると社内検索を行わず、会話と添付のみで回答します。  
         </small>  
       </div>  
+
+      <div class="form-group">
+        <div class="custom-control custom-switch">
+          <input type="checkbox" class="custom-control-input" id="ttsEnabled">
+          <label class="custom-control-label" for="ttsEnabled">回答の自動読み上げ</label>
+        </div>
+        <small class="form-text text-muted">
+          ONにすると、アシスタントの回答完了時にブラウザが音声を再生します。
+        </small>
+      </div>
   
       <hr>  
   
@@ -133,13 +140,11 @@
   
       <h5 class="mt-3">モデルに指示を与える</h5>  
   
-      <!-- 現在のsystem_messageを直接編集（保存は blur の AJAX） -->  
       <div class="form-group" style="margin-bottom: 1em;">  
         <textarea class="form-control" name="system_message" rows="4">{{ current_system_message }}</textarea>  
         <small class="form-text text-muted">編集後、フォーカスを外すと保存されます（AJAX）。</small>  
       </div>  
   
-      <!-- 登録済みの指示から選ぶ -->  
       <form method="POST" style="margin-bottom: 1em;">  
         <div class="form-group">  
           <label for="select_prompt_id">登録済みの指示を選択</label>  
@@ -156,7 +161,6 @@
         </div>  
       </form>  
   
-      <!-- 新しい指示を登録 -->  
       <h6>指示を登録</h6>  
       <form method="POST" style="margin-bottom: 1em;">  
         <div class="form-group">  
@@ -171,7 +175,6 @@
         <input type="hidden" name="add_system_prompt" value="1">  
       </form>  
   
-      <!-- 共有システムプロンプト一覧 -->  
       <h6 class="mt-2">登録済みの指示一覧</h6>  
       <div class="list-group mb-3">  
         {% for p in saved_prompts %}  
@@ -280,7 +283,6 @@
       {% endif %}  
     </div>  
   
-    <!-- メインコンテンツ -->  
     <div class="col-md-9 main-content">  
       <div id="mainHeader" class="d-flex align-items-center justify-content-between mb-3">  
         <h1 class="app-title mb-0">PM Compass PRO</h1>  
@@ -298,7 +300,6 @@
       {% endif %}  
       {% endwith %}  
   
-      <!-- チャット表示領域 -->  
       <div id="chatBox" class="chat-box">  
         {% for msg in chat_history %}  
           <div class="message-container {% if msg.role=='user' %}user{% else %}assistant{% endif %}">  
@@ -319,10 +320,8 @@
         {% endfor %}  
       </div>  
   
-      <!-- RAG文書表示欄 -->  
       <div id="searchFilesDisplay" class="alert alert-secondary" style="display:none;font-size:0.95em;"></div>  
   
-      <!-- チャット入力欄 -->  
       <form id="chatForm" class="chat-input">  
         <div class="form-row">  
           <div class="col-10">  
@@ -338,7 +337,6 @@
   </div>  
 </div>  
   
-<!-- 現在の会話ID（JSから参照） -->  
 <div id="currentSession" data-session-id="{{ session.get('current_session_id','') }}" style="display:none;"></div>  
   
 <div id="docModalContainer"></div>  
@@ -668,6 +666,31 @@ document.addEventListener('DOMContentLoaded', function() {
               upsertSidebarItemById(sid2, title);  
               setCurrentSessionId(sid2);  
             }  
+
+            // ▼▼▼ 追加：スイッチがONのときだけ自動読み上げ ▼▼▼
+            const ttsSwitch = document.getElementById('ttsEnabled');
+            if (ttsSwitch && ttsSwitch.checked) {
+              // HTMLタグを除去してプレーンテキストにする
+              const tempDiv = document.createElement('div');
+              tempDiv.innerHTML = data.html;
+              const textToRead = tempDiv.textContent || tempDiv.innerText || "";
+
+              if (textToRead) {
+                // 前回の読み上げが残っていればキャンセル
+                if (window.speechSynthesis.speaking) {
+                  window.speechSynthesis.cancel();
+                }
+                
+                const utterance = new SpeechSynthesisUtterance(textToRead);
+                utterance.lang = 'ja-JP'; // 日本語
+                utterance.rate = 1.1;     // 読み上げ速度
+                
+                // 読み上げ開始
+                window.speechSynthesis.speak(utterance);
+              }
+            }
+            // ▲▲▲ 追加ここまで ▲▲▲
+
           }  
         } catch (_) {}  
       });  
@@ -918,7 +941,6 @@ document.addEventListener('DOMContentLoaded', function() {
 });  
 </script>  
   
-<!-- 最後のタブ/ウィンドウが閉じられたときにセッションのアップロードを自動削除 -->  
 <script>  
 (function(){  
   if (!('sendBeacon' in navigator)) { return; }  
@@ -950,4 +972,4 @@ document.addEventListener('DOMContentLoaded', function() {
 })();  
 </script>  
 </body>  
-</html>  
+</html>

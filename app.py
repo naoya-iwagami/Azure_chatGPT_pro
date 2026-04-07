@@ -48,7 +48,7 @@ from azure.identity import AzureCliCredential, ManagedIdentityCredential
 try:  
     import tiktoken  
 except ImportError:  
-    tiktoken = None  
+    tiktoken = None
 
 # ------------------------------- アプリ環境/Flask -------------------------------  
 APP_ENV = os.getenv("APP_ENV", "prod").lower()  
